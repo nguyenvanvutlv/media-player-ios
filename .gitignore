@@ -60,3 +60,9 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+./FFmpeg/
+
+# FFmpeg build artifacts (see scripts/build-ffmpeg-xcframework.sh)
+docs/
+output/
+.DS_Store

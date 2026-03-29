@@ -1,0 +1,5 @@
+// Linker flags when using output/libffmpeg.xcframework (static) in an iOS/tvOS target.
+// Add this file via Build Settings → Other Linker Flags, or merge into your .xcconfig.
+// Also add the xcframework under Frameworks, Libraries, and Embedded Content (Do Not Embed for static).
+
+OTHER_LDFLAGS = $(inherited) -ObjC -lz -lbz2 -liconv -framework AudioToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -framework VideoToolbox -framework QuartzCore
