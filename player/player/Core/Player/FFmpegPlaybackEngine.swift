@@ -180,11 +180,20 @@ final class FFmpegPlaybackEngine {
     /// Set after `performSeek` when a video stream exists; cleared on first decoded video frame (watchdog for stuck seek).
     private var postSeekAwaitingFirstVideoFrame = false
 
+    // MARK: - Post-seek buffering gate
+    /// When true, video timebase and audio are held paused while buffers fill.
+    private var postSeekBuffering = false
+    private let bufferingMinVideoFrames = 8
+    private let bufferingMinAudioSeconds: Double = 0.3
+
     /// Same constant offset applied to video PTS in `CoreVideoDecoder` so A/V share one media timeline.
     private var audioScheduleShiftSeconds: Double = 0
     private var audioSessionAnchorPtsSec: Double?
     /// End sample index of last scheduled buffer (avoids overlap when rounding).
     private var lastAudioScheduleEndSample: AVAudioFramePosition?
+    /// Offset to convert cumulative `playerTime.sampleTime` to the relative timeline
+    /// used by `lastAudioScheduleEndSample`. Set at each seek to the node’s current playhead.
+    private var audioPlayheadSampleOffset: AVAudioFramePosition = 0
 
     /// Limits how far ahead of playback we push `scheduleBuffer` (reduces HAL “overload” from bursty scheduling).
     private let maxAudioScheduledAheadSeconds: Double = 1.5
@@ -744,7 +753,7 @@ final class FFmpegPlaybackEngine {
         if let end = lastAudioScheduleEndSample, sampleTime < end {
             sampleTime = end
         }
-        let when = AVAudioTime(sampleTime: sampleTime, atRate: sr)
+        let when = AVAudioTime(sampleTime: sampleTime + audioPlayheadSampleOffset, atRate: sr)
         node.scheduleBuffer(buffer, at: when, options: [], completionHandler: nil)
         lastAudioScheduleEndSample = sampleTime + AVAudioFramePosition(buffer.frameLength)
         backlogMetricsLock.lock()
@@ -767,13 +776,17 @@ final class FFmpegPlaybackEngine {
 
         if let nodeTime = node.lastRenderTime,
            let playerTime = node.playerTime(forNodeTime: nodeTime) {
-            let playheadSec = Double(playerTime.sampleTime) / sr
+            // Subtract audioPlayheadSampleOffset so the playhead is on the same
+            // relative timeline as lastAudioScheduleEndSample (which resets to 0 at seek).
+            let relativeSample = playerTime.sampleTime - audioPlayheadSampleOffset
+            let playheadSec = Double(relativeSample) / sr
             var ahead = scheduledEndSec - playheadSec
             while ahead > aheadLimit && sessionRunning {
                 Thread.sleep(forTimeInterval: recoveringAudio ? 0.005 : 0.008)
                 guard let nt = node.lastRenderTime,
                       let pt = node.playerTime(forNodeTime: nt) else { break }
-                ahead = scheduledEndSec - Double(pt.sampleTime) / sr
+                let relSample = pt.sampleTime - audioPlayheadSampleOffset
+                ahead = scheduledEndSec - Double(relSample) / sr
             }
             return
         }
@@ -851,6 +864,7 @@ final class FFmpegPlaybackEngine {
                     logVideoFrameIfNeeded(sample)
                     sampleRenderer.pushDecodedFrame(sample)
                 }
+                checkBufferingGate()
             } else if idx == demuxer.audioStreamIndex {
                 try audioDecoder.sendPacket(packet)
                 while sessionRunning && !hasPendingSeekRequest() && !hasPendingSubtitleApplyRequest() {
@@ -858,6 +872,7 @@ final class FFmpegPlaybackEngine {
                     guard let fmt = audioDecoder.outputFormat else { break }
                     scheduleAudioBuffer(buffer, ptsStartSec: ptsStartSec, outputFormat: fmt)
                 }
+                checkBufferingGate()
             } else if subtitleStreamIndex >= 0, idx == subtitleStreamIndex {
                 let tb = demuxer.timeBase(streamIndex: subtitleStreamIndex)
                 let nopts = Self.avNoptsInt64()
@@ -994,6 +1009,12 @@ final class FFmpegPlaybackEngine {
         subtitleDecodeErrorCount = 0
         audioSessionAnchorPtsSec = nil
         lastAudioScheduleEndSample = nil
+        // Capture the node’s current playhead so pacing compares on the same relative timeline.
+        if let node = audioPlayerNode,
+           let nt = node.lastRenderTime,
+           let pt = node.playerTime(forNodeTime: nt) {
+            audioPlayheadSampleOffset = pt.sampleTime
+        }
         PlaybackLog.audio("[Audio] schedule state cleared (anchor + queued sample cursor)")
 
         // Audio seek: avoid restarting audio engine on every seek (can cause visible stutter on some devices).
@@ -1026,6 +1047,10 @@ final class FFmpegPlaybackEngine {
 
         PlaybackLog.seek("Pipeline resumed from new position anchor=\(String(format: "%.3f", seconds))s")
 
+        // Enter post-seek buffering: hold video timebase + audio node paused until thresholds met.
+        postSeekBuffering = true
+        audioPlayerNode?.pause()
+
         if demuxer.videoStreamIndex >= 0 {
             postSeekAwaitingFirstVideoFrame = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -1040,6 +1065,39 @@ final class FFmpegPlaybackEngine {
                 }
             }
         }
+    }
+
+    /// Checks if post-seek buffering thresholds are met; if so, starts playback atomically.
+    private func checkBufferingGate() {
+        guard postSeekBuffering else { return }
+
+        let videoReady: Bool
+        if demuxer.videoStreamIndex >= 0 {
+            videoReady = sampleRenderer.fifoCount >= bufferingMinVideoFrames
+        } else {
+            videoReady = true // no video stream → skip check
+        }
+
+        let audioReady: Bool
+        if demuxer.audioStreamIndex >= 0 {
+            let scheduled = Double(lastAudioScheduleEndSample ?? 0) / (audioDecoder.outputFormat?.sampleRate ?? 44100)
+            audioReady = scheduled >= bufferingMinAudioSeconds
+        } else {
+            audioReady = true // no audio stream → skip check
+        }
+
+        guard videoReady && audioReady else { return }
+
+        // Thresholds met — start playback atomically.
+        postSeekBuffering = false
+        PlaybackLog.seek("[Seek] buffering complete: video_fifo=\(sampleRenderer.fifoCount) audio_sched=\(String(format: "%.2f", Double(lastAudioScheduleEndSample ?? 0) / (audioDecoder.outputFormat?.sampleRate ?? 44100)))s")
+
+        // Release the display timebase and audio atomically (sync ensures they start at the same instant).
+        DispatchQueue.main.sync { [weak self] in
+            self?.sampleRenderer.releaseTimebaseHold()
+        }
+        // Resume audio playback.
+        audioPlayerNode?.play()
     }
 
     private static func avNoptsInt64() -> Int64 {

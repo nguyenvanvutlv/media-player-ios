@@ -77,6 +77,11 @@ final class SampleBufferRenderer {
     private var drainSuspended: Bool = false
     private var lastLoggedDisplayErrorDescription: String?
 
+    // MARK: - Post-seek buffering gate
+    /// When `true`, frames are enqueued to the display layer but the timebase stays paused.
+    /// The engine sets this during post-seek buffering and clears it via `releaseTimebaseHold()`.
+    private var holdTimebase: Bool = false
+
     /// Bounded queue: 4K NV12 frames are large; cap depth to limit memory while keeping short bursts (was 40).
     private let fifo = BoundedVideoFIFO(capacity: 28)
     private var sessionStopped = true
@@ -90,6 +95,9 @@ final class SampleBufferRenderer {
 
     /// Called on the main queue when the first video frame is enqueued after `beginPlaybackSession` / seek flush.
     var onFirstFrameEnqueued: (() -> Void)?
+
+    /// Number of frames currently in the FIFO (used by engine for buffering gate).
+    var fifoCount: Int { fifo.count() }
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -280,7 +288,7 @@ final class SampleBufferRenderer {
             recoveryLock.unlock()
             return active
         }()
-        let maxPerDrain = recovering ? 3 : 6
+        let maxPerDrain = recovering ? 6 : 8
         while displayLayer.isReadyForMoreMediaData && enqueued < maxPerDrain {
             guard let sb = fifo.take() else {
                 // Prevent main-thread callback spin when FIFO is empty.
@@ -304,13 +312,18 @@ final class SampleBufferRenderer {
                 displayLayer.enqueue(sampleBuffer)
                 if prefillRemaining == 0 {
                     timelineStarted = true
-                    try? controlTimebase?.setTime(CMTime.zero)
-                    try? controlTimebase?.setRate(1.0)
+                    // Only start playback if the buffering gate is NOT held.
+                    if !holdTimebase {
+                        try? controlTimebase?.setTime(CMTime.zero)
+                        try? controlTimebase?.setRate(1.0)
+                    }
                 }
             } else {
                 timelineStarted = true
-                try? controlTimebase?.setTime(CMTime.zero)
-                try? controlTimebase?.setRate(1.0)
+                if !holdTimebase {
+                    try? controlTimebase?.setTime(CMTime.zero)
+                    try? controlTimebase?.setRate(1.0)
+                }
                 displayLayer.enqueue(sampleBuffer)
             }
         } else {
@@ -380,6 +393,7 @@ final class SampleBufferRenderer {
     func flushForSeek() {
         fifo.clear()
         displayLayer.flush()
+        holdTimebase = true  // arm the buffering gate
         timelineStarted = false
         prefillRemaining = 2
         didEmitFirstFrameForSession = false
@@ -387,5 +401,25 @@ final class SampleBufferRenderer {
         lastLoggedDisplayErrorDescription = nil
         try? controlTimebase?.setTime(.zero)
         try? controlTimebase?.setRate(0)
+    }
+
+    // MARK: - Buffering gate
+
+    /// Called by the engine to hold the display timebase while post-seek buffering accumulates.
+    func setHoldTimebase(_ hold: Bool) {
+        holdTimebase = hold
+    }
+
+    /// Called by the engine when minimum buffering thresholds are met.
+    /// Starts the display timebase so video begins rendering.
+    func releaseTimebaseHold() {
+        holdTimebase = false
+        if timelineStarted {
+            try? controlTimebase?.setTime(.zero)
+            try? controlTimebase?.setRate(1.0)
+        }
+        // Kick off immediate draining so buffered frames reach the display layer now.
+        startRequestingMediaData()
+        drainWhileReady()
     }
 }
