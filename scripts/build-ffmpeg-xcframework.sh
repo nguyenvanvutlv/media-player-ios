@@ -18,6 +18,7 @@ OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/output}"
 BUILD_ROOT="${BUILD_ROOT:-${OUT_ROOT}/build}"
 LICENSE_DIR="${OUT_ROOT}/LICENSE"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+BUILD_LOG="${OUT_ROOT}/ffmpeg-build.log"
 
 MIN_IOS="${MIN_IOS:-13.0}"
 MIN_TVOS="${MIN_TVOS:-13.0}"
@@ -35,6 +36,8 @@ command -v libtool >/dev/null || die "libtool not found (expected /usr/bin/libto
 
 mkdir -p "${OUT_ROOT}" "${BUILD_ROOT}" "${LICENSE_DIR}"
 
+rm -f "${BUILD_LOG}"
+
 cp -f "${FFMPEG_SRC}/LICENSE.md" "${LICENSE_DIR}/" 2>/dev/null || true
 cp -f "${FFMPEG_SRC}/COPYING.LGPLv2.1" "${LICENSE_DIR}/" 2>/dev/null || true
 cp -f "${FFMPEG_SRC}/COPYING.LGPLv3" "${LICENSE_DIR}/" 2>/dev/null || true
@@ -48,6 +51,23 @@ STATIC_LIBS=(
   libswscale
   libswresample
 )
+
+#
+# Whitelist build (required by refactor plan):
+# - Start from nothing: --disable-everything
+# - Enable only required components explicitly
+#
+declare -a REQ_DEMUXERS=(hls mpegts mov matroska)
+declare -a REQ_DECODERS=(h264 hevc vp8 vp9 aac ac3 eac3 opus vorbis dca ass subrip webvtt)
+declare -a REQ_PARSERS=(h264 hevc aac ac3)
+declare -a REQ_PROTOCOLS=(http https tcp tls file crypto)
+
+# Some components can be auto-enabled as dependencies even with `--disable-everything`.
+# Keep a small explicit denylist to satisfy the required whitelist exactly.
+declare -a DENY_DECODERS=(av1)
+# NOTE: bash + `set -u` can treat empty arrays as "unbound" in some environments.
+# Use a sentinel value to represent "no entries".
+declare -a DENY_PARSERS=(__none__)
 
 merge_static_libs() {
   local out="$1"
@@ -98,7 +118,36 @@ run_configure_make_install() {
   local cflags="-arch ${clang_arch} -isysroot ${sysroot} ${min_cflags}"
   local ldflags="-arch ${clang_arch} -isysroot ${sysroot} ${min_ldflags}"
 
+  local enable_demuxers=()
+  local enable_decoders=()
+  local enable_parsers=()
+  local enable_protocols=()
+  local disable_decoders=()
+  local disable_parsers_flags=""
+  local item
+  for item in "${REQ_DEMUXERS[@]}"; do enable_demuxers+=("--enable-demuxer=${item}"); done
+  for item in "${REQ_DECODERS[@]}"; do enable_decoders+=("--enable-decoder=${item}"); done
+  for item in "${REQ_PARSERS[@]}"; do enable_parsers+=("--enable-parser=${item}"); done
+  for item in "${REQ_PROTOCOLS[@]}"; do enable_protocols+=("--enable-protocol=${item}"); done
+  for item in "${DENY_DECODERS[@]}"; do disable_decoders+=("--disable-decoder=${item}"); done
+  for item in "${DENY_PARSERS[@]}"; do
+    [[ "${item}" == "__none__" ]] && continue
+    disable_parsers_flags+=" --disable-parser=${item}"
+  done
+
   pushd "${build_dir}" >/dev/null
+
+  {
+    echo "=== ${name} ==="
+    echo "sdk=${sdk} arch=${clang_arch} ff_arch=${ff_arch}"
+    echo "configure whitelist:"
+    echo "  demuxers:   ${REQ_DEMUXERS[*]}"
+    echo "  decoders:   ${REQ_DECODERS[*]}"
+    echo "  parsers:    ${REQ_PARSERS[*]}"
+    echo "  protocols:  ${REQ_PROTOCOLS[*]}"
+    echo "  extra:      ${FFMPEG_EXTRA_CONFIGURE:-<none>}"
+    echo
+  } >> "${BUILD_LOG}"
 
   # shellcheck disable=SC2086
   if ! \
@@ -115,6 +164,7 @@ run_configure_make_install() {
     --target-os=darwin \
     --enable-cross-compile \
     ${asm_flags} \
+    --disable-everything \
     --disable-programs \
     --disable-doc \
     --disable-avdevice \
@@ -136,35 +186,56 @@ run_configure_make_install() {
     --enable-audiotoolbox \
     --enable-hwaccel=h264_videotoolbox \
     --enable-hwaccel=hevc_videotoolbox \
-    --enable-hwaccel=av1_videotoolbox \
-    --enable-decoder=h264 \
-    --enable-decoder=hevc \
-    --enable-decoder=vp9 \
-    --enable-decoder=av1 \
-    --enable-decoder=aac \
-    --enable-decoder=ac3 \
-    --enable-decoder=eac3 \
-    --enable-decoder=dca \
-    --enable-decoder=ass \
-    --enable-decoder=subrip \
-    --enable-decoder=srt \
-    --enable-decoder=webvtt \
+    "${enable_demuxers[@]}" \
+    "${enable_decoders[@]}" \
+    "${enable_parsers[@]}" \
+    "${enable_protocols[@]}" \
+    "${disable_decoders[@]}" \
+    ${disable_parsers_flags} \
     --extra-cflags="${cflags}" \
     --extra-ldflags="${ldflags}" \
     ${FFMPEG_EXTRA_CONFIGURE} \
-    >&2
+    2>&1 | tee -a "${BUILD_LOG}" >&2
   then
     popd >/dev/null
     return 1
   fi
 
-  if ! make -j"${JOBS}" >&2; then
+  if ! make -j"${JOBS}" 2>&1 | tee -a "${BUILD_LOG}" >&2; then
     popd >/dev/null
     return 1
   fi
-  if ! make install DESTDIR="${staging}" >&2; then
+  if ! make install DESTDIR="${staging}" 2>&1 | tee -a "${BUILD_LOG}" >&2; then
     popd >/dev/null
     return 1
+  fi
+
+  # Persist build evidence per-slice for auditing/repro:
+  mkdir -p "${OUT_ROOT}/ffmpeg-config/${name}"
+  cp -f "${build_dir}/ffbuild/config.log" "${OUT_ROOT}/ffmpeg-config/${name}/config.log" 2>/dev/null || true
+  cp -f "${build_dir}/ffbuild/config.mak" "${OUT_ROOT}/ffmpeg-config/${name}/config.mak" 2>/dev/null || true
+  cp -f "${build_dir}/config.h" "${OUT_ROOT}/ffmpeg-config/${name}/config.h" 2>/dev/null || true
+
+  # Emit a small, parseable enabled-components report from config.mak.
+  # Note: `--disable-everything` + explicit enables should make these lists tight.
+  if [[ -f "${build_dir}/ffbuild/config.mak" ]]; then
+    {
+      echo "# ${name} enabled components (from ffbuild/config.mak)"
+      echo "[demuxers]"
+      grep -E '^CONFIG_[A-Za-z0-9_]+_DEMUXER=yes$' "${build_dir}/ffbuild/config.mak" | sed -E 's/^CONFIG_//; s/_DEMUXER=yes$//; s/_/./g' | sort
+      echo
+      echo "[decoders]"
+      grep -E '^CONFIG_[A-Za-z0-9_]+_DECODER=yes$' "${build_dir}/ffbuild/config.mak" | sed -E 's/^CONFIG_//; s/_DECODER=yes$//; s/_/./g' | sort
+      echo
+      echo "[parsers]"
+      grep -E '^CONFIG_[A-Za-z0-9_]+_PARSER=yes$' "${build_dir}/ffbuild/config.mak" | sed -E 's/^CONFIG_//; s/_PARSER=yes$//; s/_/./g' | sort
+      echo
+      echo "[protocols]"
+      grep -E '^CONFIG_[A-Za-z0-9_]+_PROTOCOL=yes$' "${build_dir}/ffbuild/config.mak" | sed -E 's/^CONFIG_//; s/_PROTOCOL=yes$//; s/_/./g' | sort
+      echo
+      echo "[hwaccels]"
+      grep -E '^CONFIG_[A-Za-z0-9_]+_HWACCEL=yes$' "${build_dir}/ffbuild/config.mak" | sed -E 's/^CONFIG_//; s/_HWACCEL=yes$//; s/_/./g' | sort
+    } > "${OUT_ROOT}/ffmpeg-config/${name}/enabled-components.txt"
   fi
 
   popd >/dev/null
@@ -412,3 +483,5 @@ echo "Built: ${XCFW}" >&2
 echo "Docs:  ${OUT_ROOT}/README_LGPL.md" >&2
 echo "Licenses: ${LICENSE_DIR}/" >&2
 echo "Linker flags sample: ${OUT_ROOT}/xcode-link-flags.xcconfig" >&2
+echo "Build log: ${BUILD_LOG}" >&2
+echo "Config snapshots: ${OUT_ROOT}/ffmpeg-config/" >&2
