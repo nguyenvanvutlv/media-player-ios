@@ -209,6 +209,7 @@ final class PlayerController {
             hadActiveSubtitleFrame = false
             if state.subtitleOverlayImage != nil || state.currentSubtitleText != nil {
                 state.subtitleOverlayImage = nil
+                state.subtitleOverlayIsFullFrame = false
                 state.currentSubtitleText = nil
                 lastSubtitleOverlaySignature = nil
             }
@@ -217,6 +218,21 @@ final class PlayerController {
 
         hadActiveSubtitleFrame = true
         lastSubtitleNoFrameLogTime = nil
+
+        // Bitmap subtitle image (PGS/DVB/DVD): display the decoded image directly.
+        if let bmp = frame.bitmapImage {
+            let w = max(60, state.subtitleLayoutWidth)
+            let scale = max(1.0, state.subtitleDisplayScale)
+            let widthBucket = Int((w / 8.0).rounded(.down)) * 8
+            let scaleBucket = Int((scale * 10.0).rounded())
+            let sig = "bmp|\(frame.ptsMs)|\(Int(bmp.size.width))x\(Int(bmp.size.height))|w\(widthBucket)|s\(scaleBucket)"
+            guard sig != lastSubtitleOverlaySignature else { return }
+            lastSubtitleOverlaySignature = sig
+            state.currentSubtitleText = nil
+            state.subtitleOverlayIsFullFrame = true
+            state.subtitleOverlayImage = bmp
+            return
+        }
 
         // Avoid expensive re-rasterization when layout width/scale fluctuate by tiny amounts.
         // Bucket width/scale so 1px layout jitter doesn't invalidate the signature.
@@ -230,6 +246,7 @@ final class PlayerController {
         lastSubtitleOverlaySignature = sig
 
         state.currentSubtitleText = frame.plainText
+        state.subtitleOverlayIsFullFrame = false
         // Throttle UI subtitle render logging/rasterization in very hot scenarios (post-seek recovery).
         let now = CACurrentMediaTime()
         if sampleRenderer.isRecoveringFromSeek(),

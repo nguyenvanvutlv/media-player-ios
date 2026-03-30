@@ -19,6 +19,8 @@ struct FFmpegStreamInfo {
 final class FFmpegDemuxer {
     private(set) var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var packet: UnsafeMutablePointer<AVPacket>?
+    private var interruptState: UnsafeMutablePointer<FFmpegInterruptState>?
+    private var readTimeoutSeconds: Double = 8.0
 
     private(set) var videoStreamIndex: Int = -1
     /// Active audio stream; may be switched to any entry in `audioStreamIndices`.
@@ -40,7 +42,16 @@ final class FFmpegDemuxer {
         subtitleStreamIndices = []
         durationSeconds = 0
 
-        var fmt: UnsafeMutablePointer<AVFormatContext>?
+        // Allocate format context so we can install `interrupt_callback` BEFORE open.
+        var fmt: UnsafeMutablePointer<AVFormatContext>? = avformat_alloc_context()
+        if fmt == nil { throw FFmpegDemuxerError.openFailed(code: ff_err_enomem()) }
+
+        interruptState = UnsafeMutablePointer<FFmpegInterruptState>.allocate(capacity: 1)
+        interruptState?.initialize(to: FFmpegInterruptState(cancel: 0, deadline_us: 0))
+        if let st = interruptState, let f = fmt {
+            ff_format_set_interrupt_callback(f, st)
+        }
+
         let cstr = url.absoluteString.cString(using: .utf8)!
         var ret = avformat_open_input(&fmt, cstr, nil, nil)
         if ret < 0 { throw FFmpegDemuxerError.openFailed(code: ret) }
@@ -217,6 +228,11 @@ final class FFmpegDemuxer {
             avformat_close_input(&formatContext)
             formatContext = nil
         }
+        if let st = interruptState {
+            st.deinitialize(count: 1)
+            st.deallocate()
+            interruptState = nil
+        }
         videoStreamIndex = -1
         audioStreamIndex = -1
         audioStreamIndices = []
@@ -234,6 +250,12 @@ final class FFmpegDemuxer {
     /// Returns `true` if a packet was read; `false` on EOF. Packet is valid until next read.
     func readPacket() throws -> Bool {
         guard let fmt = formatContext, let pkt = packet else { return false }
+        // Deadline-based interrupt: prevents indefinite blocking on network reads.
+        if let st = interruptState, readTimeoutSeconds > 0 {
+            let now = ff_time_us()
+            let deadline = now + Int64(readTimeoutSeconds * 1_000_000.0)
+            ff_interrupt_state_set_deadline_us(st, deadline)
+        }
         let ret = av_read_frame(fmt, pkt)
         if ret < 0 {
             if ffmpeg_is_eof(Int32(ret)) != 0 {
@@ -242,6 +264,25 @@ final class FFmpegDemuxer {
             throw FFmpegDemuxerError.openFailed(code: ret)
         }
         return true
+    }
+
+    /// Set read timeout (seconds) used by the interrupt callback. Set <= 0 to disable deadlines.
+    func setReadTimeoutSeconds(_ seconds: Double) {
+        readTimeoutSeconds = seconds
+    }
+
+    /// Interrupt a blocking demux read ASAP (used when seek/stop is requested).
+    func interruptBlockingIO() {
+        if let st = interruptState {
+            ff_interrupt_state_cancel(st)
+        }
+    }
+
+    /// Clear cancel/deadline after an interrupt-triggered unwind.
+    func clearInterrupt() {
+        if let st = interruptState {
+            ff_interrupt_state_reset(st)
+        }
     }
 
     var currentPacket: UnsafeMutablePointer<AVPacket>? { packet }

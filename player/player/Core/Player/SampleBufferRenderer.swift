@@ -142,6 +142,11 @@ final class SampleBufferRenderer {
 
     /// Requests a drain pass on the main queue (no-op if suspended/stopped).
     func requestDrain() {
+        requestLock.lock()
+        let already = mainDrainScheduled
+        if !already { mainDrainScheduled = true }
+        requestLock.unlock()
+        guard !already else { return }
         DispatchQueue.main.async { [weak self] in
             self?.drainWhileReady()
         }
@@ -269,6 +274,11 @@ final class SampleBufferRenderer {
     }
 
     private func drainWhileReady() {
+        // Clear the coalescing flag now that we're on main.
+        requestLock.lock()
+        mainDrainScheduled = false
+        requestLock.unlock()
+
         guard !sessionStopped else { return }
         drainControlLock.lock()
         let suspended = drainSuspended

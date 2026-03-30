@@ -1,11 +1,16 @@
 #include <libavutil/error.h>
+#include <libavutil/time.h>
 #include <errno.h>
 #include <stdint.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+
+// Local declarations shared with Swift via header.
+#include "FFmpegBridge.h"
 
 static enum AVPixelFormat ff_get_format_videotoolbox(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
 {
@@ -80,5 +85,40 @@ void ff_sws_free(void *sws) {
     /* FFmpeg 6+ API: sws_freeContext(SwsContext *) — not SwsContext ** */
     if (!sws) return;
     sws_freeContext((struct SwsContext *)sws);
+}
+
+int64_t ff_time_us(void) {
+    return av_gettime_relative();
+}
+
+static int ff_interrupt_callback(void *opaque) {
+    if (!opaque) return 0;
+    FFmpegInterruptState *st = (FFmpegInterruptState *)opaque;
+    if (st->cancel) return 1;
+    int64_t d = st->deadline_us;
+    if (d > 0 && av_gettime_relative() >= d) return 1;
+    return 0;
+}
+
+void ff_interrupt_state_reset(FFmpegInterruptState *st) {
+    if (!st) return;
+    st->cancel = 0;
+    st->deadline_us = 0;
+}
+
+void ff_interrupt_state_cancel(FFmpegInterruptState *st) {
+    if (!st) return;
+    st->cancel = 1;
+}
+
+void ff_interrupt_state_set_deadline_us(FFmpegInterruptState *st, int64_t deadline_us) {
+    if (!st) return;
+    st->deadline_us = deadline_us;
+}
+
+void ff_format_set_interrupt_callback(AVFormatContext *fmt, FFmpegInterruptState *st) {
+    if (!fmt) return;
+    fmt->interrupt_callback.callback = ff_interrupt_callback;
+    fmt->interrupt_callback.opaque = st;
 }
 

@@ -428,6 +428,7 @@
 					"\"$(PROJECT_DIR)/player/FFmpegBridge\"",
 				);
 				INFOPLIST_FILE = player/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "MediaData Player";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -505,6 +506,7 @@
 					"\"$(PROJECT_DIR)/player/FFmpegBridge\"",
 				);
 				INFOPLIST_FILE = player/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "MediaData Player";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;

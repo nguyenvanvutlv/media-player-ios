@@ -5,6 +5,8 @@ import UIKit
 struct AssBitmapOverlayView: UIViewRepresentable {
     var image: UIImage?
     var verticalOffset: CGFloat = 0
+    /// When `true`, the image is positioned to cover the full video bounds (used for bitmap subtitles like PGS/DVB/DVD).
+    var fullFrame: Bool = false
 
     func makeUIView(context: Context) -> AssBitmapOverlayContainerView {
         let v = AssBitmapOverlayContainerView()
@@ -15,6 +17,7 @@ struct AssBitmapOverlayView: UIViewRepresentable {
     func updateUIView(_ uiView: AssBitmapOverlayContainerView, context: Context) {
         uiView.setOverlayImage(image)
         uiView.verticalOffset = verticalOffset
+        uiView.fullFrame = fullFrame
     }
 }
 
@@ -23,6 +26,9 @@ final class AssBitmapOverlayContainerView: UIView {
     private let imageView = UIImageView()
     private var lastPlacementSignature: String?
     var verticalOffset: CGFloat = 0 {
+        didSet { setNeedsLayout() }
+    }
+    var fullFrame: Bool = false {
         didSet { setNeedsLayout() }
     }
 
@@ -48,6 +54,12 @@ final class AssBitmapOverlayContainerView: UIView {
             imageView.frame = .zero
             return
         }
+        if fullFrame {
+            imageView.contentMode = .scaleAspectFit
+            imageView.frame = bounds
+            return
+        }
+        imageView.contentMode = .scaleAspectFit
         let maxW = bounds.width - 40
         let scale = min(1, maxW / max(img.size.width, 1))
         let w = img.size.width * scale

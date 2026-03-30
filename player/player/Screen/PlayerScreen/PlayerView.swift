@@ -48,7 +48,8 @@ struct PlayerView: View {
             GeometryReader { geo in
                 AssBitmapOverlayView(
                     image: state.subtitleOverlayImage,
-                    verticalOffset: CGFloat(state.subtitleOverlayVerticalOffset)
+                    verticalOffset: CGFloat(state.subtitleOverlayVerticalOffset),
+                    fullFrame: state.subtitleOverlayIsFullFrame
                 )
                     .frame(width: geo.size.width, height: geo.size.height)
                     .allowsHitTesting(false)

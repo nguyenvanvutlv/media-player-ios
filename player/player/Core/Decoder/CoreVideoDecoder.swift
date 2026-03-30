@@ -28,6 +28,10 @@ final class CoreVideoDecoder {
     private var cachedVideoFormatDesc: CMVideoFormatDescription?
     private var cachedVideoFormatKey: (w: Int, h: Int, pf: OSType)?
     private var loggedFirstFrameSummary = false
+    private var logged4kSoftwareWarning = false
+    private var isUsingVideoToolbox: Bool = false
+    private var openedWidth: Int = 0
+    private var openedHeight: Int = 0
 
     /// First frame’s media time (seconds); following frames are relative so PTS starts near 0 for `CMTimebase`.
     private var timelineOriginSeconds: Double?
@@ -53,6 +57,9 @@ final class CoreVideoDecoder {
 
     init() {}
 
+    func isHardwareDecoding() -> Bool { isUsingVideoToolbox }
+    func openedDimensions() -> (w: Int, h: Int) { (openedWidth, openedHeight) }
+
     func setPresentationShiftSeconds(_ seconds: Double) {
         presentationShiftSeconds = max(0, seconds)
     }
@@ -62,6 +69,12 @@ final class CoreVideoDecoder {
     func setSeekTarget(_ seconds: Double) {
         seekTargetPtsSeconds = seconds
         seekSkippedFrameCount = 0
+        // Align post-seek timeline so the first on-target frame lands near t=0
+        // relative to the seek target (the engine sets `mediaTimelineAnchor = seconds`).
+        timelineOriginSeconds = seconds
+        timelineOriginLock.lock()
+        syncedFirstFrameMediaSeconds = seconds
+        timelineOriginLock.unlock()
         // Tell FFmpeg to skip non-reference B-frames during catch-up (cheaper decode).
         if let ctx = codecContext {
             ctx.pointee.skip_frame = AVDISCARD_NONREF
@@ -136,16 +149,23 @@ final class CoreVideoDecoder {
         codecContext = ctx
         let w = Int(ctx.pointee.width)
         let h = Int(ctx.pointee.height)
+        openedWidth = w
+        openedHeight = h
+        isUsingVideoToolbox = usesVtHw
         let hwLabel = usesVtHw ? "videotoolbox" : "sw"
         PlaybackLog.video(
             "[Video] decoder=\(codecName) codec_id=\(codecpar.pointee.codec_id) hwaccel=\(hwLabel) size=\(w)x\(h)"
         )
+        PlaybackLog.video(usesVtHw ? "[Video] decoder: hardware" : "[Video] decoder: software")
         if usesVtHw {
             PlaybackLog.video("[Video] using hardware decode (VideoToolbox hwaccel + \(codecName) decoder)")
         }
-        if codecpar.pointee.codec_id == AV_CODEC_ID_HEVC, !usesVtHw, w > 1920 || h > 1080 {
+        if !usesVtHw,
+           (codecpar.pointee.codec_id == AV_CODEC_ID_HEVC || codecpar.pointee.codec_id == AV_CODEC_ID_H264),
+           (w >= 3840 || h >= 2160)
+        {
             PlaybackLog.video(
-                "[Video][WARN] HEVC software decode at \(w)x\(h) — high CPU; check device/simulator and FFmpeg hwaccel build"
+                "[Video][WARN] 4K software decode detected at \(w)x\(h) — expected VideoToolbox; playback may stutter"
             )
         }
         frame = av_frame_alloc()
@@ -198,6 +218,9 @@ final class CoreVideoDecoder {
         cachedVideoFormatDesc = nil
         cachedVideoFormatKey = nil
         loggedFirstFrameSummary = false
+        isUsingVideoToolbox = false
+        openedWidth = 0
+        openedHeight = 0
         timelineOriginSeconds = nil
         timelineOriginLock.lock()
         syncedFirstFrameMediaSeconds = nil
@@ -272,6 +295,10 @@ final class CoreVideoDecoder {
         let h = Int(frame.pointee.height)
         let fmt = Int32(frame.pointee.format)
         PlaybackLog.video("[Video] first frame path=\(path) pix_fmt=\(fmt) size=\(w)x\(h)")
+        if !isUsingVideoToolbox, !logged4kSoftwareWarning, (w >= 3840 || h >= 2160) {
+            logged4kSoftwareWarning = true
+            PlaybackLog.video("[Video][WARN] SW decode detected for 4K (pix_fmt=\(fmt))")
+        }
     }
 
     private func makeSampleBufferFromVideoToolbox(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) throws -> CMSampleBuffer {

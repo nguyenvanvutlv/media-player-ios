@@ -43,14 +43,9 @@ final class CoreAudioDecoder {
         if frame == nil { avcodec_free_context(&ctxPtr); throw CoreAudioDecoderError.openFailed(code: ff_err_enomem()) }
 
         let outRate = Int32(engineFormat.sampleRate)
-        let outCh = max(1, min(2, Int(engineFormat.channelCount)))
-        let layoutStr = outCh <= 1 ? "mono" : "stereo"
+        let outCh = max(1, Int(engineFormat.channelCount))
         var outLayout = AVChannelLayout()
-        err = layoutStr.withCString { av_channel_layout_from_string(&outLayout, $0) }
-        if err < 0 {
-            av_channel_layout_uninit(&outLayout)
-            throw CoreAudioDecoderError.openFailed(code: err)
-        }
+        av_channel_layout_default(&outLayout, Int32(outCh))
         swrOutLayout = outLayout
         swrOutLayoutInited = true
 
@@ -217,42 +212,29 @@ final class CoreAudioDecoder {
         channels: Int,
         outSamples: Int
     ) throws -> AVAudioPCMBuffer? {
-        let conv: Int32
-        var ch0 = [Float](repeating: 0, count: outSamples)
-        var ch1 = [Float](repeating: 0, count: outSamples)
-
-        if channels == 1 {
-            conv = ch0.withUnsafeMutableBufferPointer { b0 -> Int32 in
-                let pp = UnsafeMutablePointer<UnsafeMutablePointer<Float>?>.allocate(capacity: 1)
-                defer { pp.deallocate() }
-                pp[0] = b0.baseAddress
-                return ff_swr_convert_planar_flt(UnsafeMutableRawPointer(swrCtx), UnsafeMutableRawPointer(pp), Int32(outSamples), frm)
-            }
-        } else if channels == 2 {
-            conv = ch0.withUnsafeMutableBufferPointer { b0 in
-                ch1.withUnsafeMutableBufferPointer { b1 -> Int32 in
-                    let pp = UnsafeMutablePointer<UnsafeMutablePointer<Float>?>.allocate(capacity: 2)
-                    defer { pp.deallocate() }
-                    pp[0] = b0.baseAddress
-                    pp[1] = b1.baseAddress
-                    return ff_swr_convert_planar_flt(UnsafeMutableRawPointer(swrCtx), UnsafeMutableRawPointer(pp), Int32(outSamples), frm)
-                }
-            }
-        } else {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(outSamples)) else {
+            throw CoreAudioDecoderError.bufferFailed
+        }
+        guard let out = buffer.floatChannelData else {
             throw CoreAudioDecoderError.bufferFailed
         }
 
+        let pp = UnsafeMutablePointer<UnsafeMutablePointer<Float>?>.allocate(capacity: channels)
+        defer { pp.deallocate() }
+        for ch in 0..<channels {
+            pp[ch] = out[ch]
+        }
+
+        let conv = ff_swr_convert_planar_flt(
+            UnsafeMutableRawPointer(swrCtx),
+            UnsafeMutableRawPointer(pp),
+            Int32(outSamples),
+            frm
+        )
         if conv < 0 { throw CoreAudioDecoderError.openFailed(code: conv) }
         let producedPerChannel = Int(conv)
-        guard producedPerChannel > 0, let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(producedPerChannel)) else {
-            return nil
-        }
+        if producedPerChannel <= 0 { return nil }
         buffer.frameLength = AVAudioFrameCount(producedPerChannel)
-        let byteCount = producedPerChannel * MemoryLayout<Float>.size
-        memcpy(buffer.floatChannelData![0], ch0, byteCount)
-        if channels > 1 {
-            memcpy(buffer.floatChannelData![1], ch1, byteCount)
-        }
         return buffer
     }
 }

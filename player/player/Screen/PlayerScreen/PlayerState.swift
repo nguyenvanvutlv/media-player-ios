@@ -28,6 +28,8 @@ final class PlayerState: ObservableObject {
 
     /// RGBA bitmap subtitle overlay (independent of `AVSampleBufferDisplayLayer`); nil = hidden.
     @Published var subtitleOverlayImage: UIImage?
+    /// When true, the overlay image should be positioned full-frame (used for PGS/DVB/DVD bitmap subtitles).
+    @Published var subtitleOverlayIsFullFrame: Bool = false
     /// Extra bottom padding for overlay placement; positive values move subtitles up.
     @Published var subtitleOverlayVerticalOffset: Double = 0
     /// Width from layout for text wrapping (defaults until first `GeometryReader` update).
@@ -56,6 +58,7 @@ final class PlayerState: ObservableObject {
         title = ""
         currentSubtitleText = nil
         subtitleOverlayImage = nil
+        subtitleOverlayIsFullFrame = false
         subtitleOverlayVerticalOffset = 0
         subtitleLayoutWidth = 400
         alertMessage = nil

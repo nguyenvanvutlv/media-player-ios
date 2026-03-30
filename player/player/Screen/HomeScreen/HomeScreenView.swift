@@ -10,7 +10,7 @@ import SwiftUI
 struct HomeScreenView : View {
     var onSubmit: (URL) -> Void = { _ in }
     
-    @State private var urlText: String = ""
+    @State private var urlText: String = "https://dl-a10b-1531.mypikpak.com/download/?fid=T5qqLWD9kE8TT0wY7rX5n0uglEncrRO6ziXT0JA37NrfmqiPqwewHUypxKysIpFilMsiRL94w2RDItusIw79MWDoZzT-vUu_tJ2oJhKlEDU=&from=5&verno=3&prod=pikpak&expire=1774969542&g=49F7D275806B2A35736D3E325F13EAA06C9497D0&ui=aJgD4HNLZR8dbfo1&t=0&ms=50400000&th=50400000&f=4653197120&alt=0&us=0&hspu=&po=0&userid=aJgD4HNLZR8dbfo1&fileid=VOZ5-uRaCpHuqpbexxM_sDZBo2&pr=XQPkPvr9WWiIuMvELmrVeiVrimPICTTkfb5hL2-1k6dDw3Epqy3z5q6GyA1eEsVrMO3xKu8JkavWwY_3MW9lHmuyII8TbMLaPv91lr8HZp4XwN-HTlhdpKBVrptWj8vzw2PV3_rF4hV9mvEY1q2C3h6v00lHSkjRpldMOUqNO31Eii4wy9hkZJ9C8h2auy9kI1C_zXKPlyTc4xzDVBiKW3wJIOpsOfj1zgJbGTWZjd60LgLnyxFHQh4w1vTBOnuxLhqE_fukAzrPx4WcfZEDK6RMuURPmUj5mKHvCj0ZmlzYpi0cjnaOfM2GmL3PV9-HL7-JPUTifPiE0AU8NHq47BwqtJRLqYBqBxOmNNssUBofy6awhtsqTE26s1U82zmeKFzpXktXt46PgwYid62fP_ee_aX3FfDyoKDxkGol_Xajf70OYWUHCzeYQjJCCiAC&sign=178E7C40C6F9FF685DCFF4B720ECB66F"
     @State private var showInvalidURLAlert: Bool = false
     
     var body: some View {

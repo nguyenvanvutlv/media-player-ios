@@ -31,8 +31,9 @@ final class FFmpegPlaybackEngine {
     private var pendingSeekSeconds: Double?
     /// Demuxer list index (`audioStreamIndices`); applied on playback thread before `performSeek` (must not use `playbackQueue.async` — same issue as seek).
     private var pendingAudioTrackListIndex: Int?
-    /// When true, reopen audio decoder/engine for the newly selected stream without forcing a seek.
-    private var pendingAudioReopenForSwitch = false
+    /// Audio track switching strategy: SAFE switch (pause → full flush → seek to video clock → reopen → restart engine → resume).
+    /// This flag tells `packetLoop` to handle `pendingAudioTrackListIndex` by performing the SAFE switch sequence.
+    private var pendingSafeAudioSwitch = false
     private let playbackStateLock = NSLock()
     private let timelineLock = NSLock()
     private var mediaTimelineAnchor: Double = 0
@@ -99,11 +100,11 @@ final class FFmpegPlaybackEngine {
         return v
     }
 
-    private func takePendingAudioReopenForSwitchIfAny() -> Bool {
+    private func takePendingSafeAudioSwitchIfAny() -> Bool {
         playbackStateLock.lock()
         defer { playbackStateLock.unlock() }
-        let v = pendingAudioReopenForSwitch
-        pendingAudioReopenForSwitch = false
+        let v = pendingSafeAudioSwitch
+        pendingSafeAudioSwitch = false
         return v
     }
 
@@ -112,7 +113,7 @@ final class FFmpegPlaybackEngine {
     private func setPendingAudioTrackSwitch(listIndex: Int) {
         playbackStateLock.lock()
         pendingAudioTrackListIndex = listIndex
-        pendingAudioReopenForSwitch = true
+        pendingSafeAudioSwitch = true
         playbackStateLock.unlock()
     }
 
@@ -138,7 +139,7 @@ final class FFmpegPlaybackEngine {
         playbackStateLock.lock()
         pendingSeekSeconds = nil
         pendingAudioTrackListIndex = nil
-        pendingAudioReopenForSwitch = false
+        pendingSafeAudioSwitch = false
         pendingSubtitleApplyIndex = nil
         scrubbingActive = false
         presentationPaused = false
@@ -306,6 +307,8 @@ final class FFmpegPlaybackEngine {
     func stopPlayback() {
         displayLinkDriver.stop()
         sessionRunning = false
+        // If the demuxer is blocked in `av_read_frame`, interrupt so the playback thread can unwind quickly.
+        demuxer.interruptBlockingIO()
         playbackQueue.sync { }
         if Thread.isMainThread {
             sampleRenderer.stop()
@@ -326,6 +329,7 @@ final class FFmpegPlaybackEngine {
         let clamped = max(0, min(seconds, d))
         PlaybackLog.seek("UI seek(to:) clamped=\(String(format: "%.3f", clamped))s (immediate, not queued)")
         setPendingSeekSeconds(clamped)
+        demuxer.interruptBlockingIO()
         playerState.isBuffering = true
     }
 
@@ -339,7 +343,7 @@ final class FFmpegPlaybackEngine {
             return
         }
         let t = playerState.audioTracks[index]
-        PlaybackLog.audio("[Audio] switching to track=\(index) streamIndex=\(t.streamIndex) title=\(t.displayTitle) (soft switch, no seek)")
+        PlaybackLog.audio("[Audio] switching to track=\(index) streamIndex=\(t.streamIndex) title=\(t.displayTitle) (SAFE switch: pause→flush→seek→reopen→restart)")
         PlaybackLog.trackSelection(
             "[Audio] switched to track=\(index) streamIndex=\(t.streamIndex) title=\(t.displayTitle)"
         )
@@ -365,6 +369,7 @@ final class FFmpegPlaybackEngine {
     func beginScrubbing() {
         PlaybackLog.seek("UI beginScrubbing (immediate)")
         setScrubbingActive(true)
+        demuxer.interruptBlockingIO()
     }
 
     /// Clear scrubbing and queue one seek on the playback queue (ordering vs `beginScrubbing` preserved).
@@ -375,13 +380,16 @@ final class FFmpegPlaybackEngine {
         PlaybackLog.seek("UI endScrubbing(at:) clamped=\(String(format: "%.3f", clamped))s (immediate)")
         setScrubbingActive(false)
         setPendingSeekSeconds(clamped)
+        demuxer.interruptBlockingIO()
         playerState.isBuffering = true
     }
 
     /// Subtitle text for overlay at media timeline seconds (same basis as `currentTime` in `PlayerState`).
     @MainActor
     func subtitleText(forMediaTime fileTime: Double) -> String? {
-        subtitleCue(forMediaTime: fileTime)?.text
+        let cue = subtitleCue(forMediaTime: fileTime)
+        if cue?.bitmapImage != nil { return nil }
+        return cue?.text
     }
 
     /// Bitmap overlay + future libass: cue text, optional raw ASS, and start time in ms (media stream time).
@@ -389,7 +397,7 @@ final class FFmpegPlaybackEngine {
     func subtitleOverlayFrame(forMediaTime fileTime: Double) -> SubtitleOverlayFrame? {
         guard let cue = subtitleCue(forMediaTime: fileTime) else { return nil }
         let ms = Int64((cue.start * 1000.0).rounded())
-        return SubtitleOverlayFrame(plainText: cue.text, assRaw: cue.assRaw, ptsMs: ms)
+        return SubtitleOverlayFrame(plainText: cue.text, assRaw: cue.assRaw, bitmapImage: cue.bitmapImage, ptsMs: ms)
     }
 
     /// Debug-only helper: exposes basic cue stats for the currently selected subtitle track.
@@ -497,6 +505,15 @@ final class FFmpegPlaybackEngine {
 
     // MARK: - Audio engine probe
 
+    private func preferredAudioFormat(for codecpar: UnsafePointer<AVCodecParameters>) -> AVAudioFormat {
+        let sr = Double(max(8000, Int(codecpar.pointee.sample_rate)))
+        let ch = max(1, Int(codecpar.pointee.ch_layout.nb_channels))
+        if let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sr, channels: AVAudioChannelCount(ch), interleaved: false) {
+            return fmt
+        }
+        return probePlayerNodeInputFormat()
+    }
+
     private func probePlayerNodeInputFormat() -> AVAudioFormat {
         if let cachedPlayerNodeBusFormat {
             return cachedPlayerNodeBusFormat
@@ -554,32 +571,53 @@ final class FFmpegPlaybackEngine {
     private func openPipelines(url: URL) throws {
         try demuxer.open(url: url)
 
-        var videoPresentationShift: Double = 0
-        if demuxer.videoStreamIndex >= 0, demuxer.audioStreamIndex >= 0 {
-            let vStart = demuxer.streamMediaStartSeconds(streamIndex: demuxer.videoStreamIndex)
-            let aStart = demuxer.streamMediaStartSeconds(streamIndex: demuxer.audioStreamIndex)
-            if let vs = vStart, let aus = aStart {
-                videoPresentationShift = max(0, aus - vs)
-                PlaybackLog.sync(
-                    "stream starts (s): video=\(String(format: "%.6f", vs)) audio=\(String(format: "%.6f", aus)) → video PTS shift=\(String(format: "%.6f", videoPresentationShift))"
-                )
-            }
-        }
-        audioScheduleShiftSeconds = videoPresentationShift
+        // Phase 4 (seek/timeline simplification): start with no shift hacks.
+        // We align both audio and video to a common base time:
+        // - initial playback: base = first video PTS (applied after first frame is decoded)
+        // - seek: base = seek target seconds (see `setSeekTarget` + `setMediaTimelineAnchor`)
+        audioScheduleShiftSeconds = 0
 
         if demuxer.videoStreamIndex >= 0, let vp = demuxer.videoCodecParameters() {
             try videoDecoder.open(codecpar: vp)
-            videoDecoder.setPresentationShiftSeconds(videoPresentationShift)
+            videoDecoder.setPresentationShiftSeconds(0)
+            // Phase 8 perf guard: if HW decode isn't available, reject overly heavy streams early.
+#if os(iOS) || os(tvOS)
+            if !videoDecoder.isHardwareDecoding() {
+                let d = videoDecoder.openedDimensions()
+                let codecId = vp.pointee.codec_id
+                let isHEVC = codecId == AV_CODEC_ID_HEVC
+                let isH264 = codecId == AV_CODEC_ID_H264
+                // Conservative limits to avoid overheating / stutter on software decode.
+                if (isHEVC && (d.w > 1920 || d.h > 1080)) || (isH264 && (d.w > 3840 || d.h > 2160)) {
+                    PlaybackLog.video("[Video][ERROR] rejecting SW decode \(d.w)x\(d.h) codec_id=\(codecId) (no VideoToolbox)")
+                    throw NSError(
+                        domain: "FFmpegPlaybackEngine",
+                        code: 1001,
+                        userInfo: [NSLocalizedDescriptionKey: "Device does not support hardware decode for this stream (\(d.w)x\(d.h))."]
+                    )
+                }
+            }
+#endif
         }
         if demuxer.audioStreamIndex >= 0, let ap = demuxer.audioCodecParameters() {
-            let engineFmt = probePlayerNodeInputFormat()
+            let engineFmt = preferredAudioFormat(for: ap)
             let aTb = demuxer.audioTimeBase()
-            try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
-            decoderAudioStreamIndex = demuxer.audioStreamIndex
-        }
-
-        if let fmt = audioDecoder.outputFormat {
-            try installAudioEngine(with: fmt)
+            do {
+                try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
+                decoderAudioStreamIndex = demuxer.audioStreamIndex
+                if let fmt = audioDecoder.outputFormat {
+                    try installAudioEngine(with: fmt)
+                }
+            } catch {
+                // Fallback: if the engine doesn't support multichannel, drop to system bus format.
+                PlaybackLog.audio("[Audio][WARN] multichannel engine format failed; fallback to bus format (\(error.localizedDescription))")
+                let fallbackFmt = probePlayerNodeInputFormat()
+                try audioDecoder.open(codecpar: ap, engineFormat: fallbackFmt, timeBase: aTb)
+                decoderAudioStreamIndex = demuxer.audioStreamIndex
+                if let fmt = audioDecoder.outputFormat {
+                    try installAudioEngine(with: fmt)
+                }
+            }
         }
 
         let audio = Self.buildAudioTracks(demuxer: demuxer)
@@ -696,7 +734,7 @@ final class FFmpegPlaybackEngine {
                 }
                 let cname = demuxer.streamInfo(streamIndex: si)?.codecName ?? "?"
                 PlaybackLog.subtitleSelection(
-                    "subtitle decoder open OK streamIndex=\(si) codec=\(cname) (soft switch, no seek)"
+                    "subtitle decoder open OK streamIndex=\(si) codec=\(cname) (no seek)"
                 )
             } catch {
                 subtitleStreamIndex = -1
@@ -742,11 +780,18 @@ final class FFmpegPlaybackEngine {
     /// Schedules PCM on the player timeline using FFmpeg PTS + the same shift as `CoreVideoDecoder` (lip-sync).
     private func scheduleAudioBuffer(_ buffer: AVAudioPCMBuffer, ptsStartSec: Double, outputFormat: AVAudioFormat) {
         guard let node = audioPlayerNode else { return }
-        if audioSessionAnchorPtsSec == nil {
-            audioSessionAnchorPtsSec = ptsStartSec
+        // Use the same base as the UI/video timeline (mediaTimelineAnchor).
+        // If the anchor hasn't been established yet (pre-first-video-frame),
+        // fall back to the first audio PTS as a temporary base.
+        let base: Double
+        let anchor = mediaTimelineAnchorValue()
+        if anchor > 0 {
+            base = anchor
+        } else {
+            if audioSessionAnchorPtsSec == nil { audioSessionAnchorPtsSec = ptsStartSec }
+            base = audioSessionAnchorPtsSec!
         }
-        let anchor = audioSessionAnchorPtsSec!
-        var relSec = (ptsStartSec - anchor) + audioScheduleShiftSeconds
+        var relSec = (ptsStartSec - base) + audioScheduleShiftSeconds
         if relSec < 0 { relSec = 0 }
         let sr = outputFormat.sampleRate
         var sampleTime = AVAudioFramePosition((relSec * sr).rounded())
@@ -759,7 +804,104 @@ final class FFmpegPlaybackEngine {
         backlogMetricsLock.lock()
         lastAudioScheduledEndSeconds = Double(lastAudioScheduleEndSample ?? 0) / sr
         backlogMetricsLock.unlock()
+
+#if DEBUG
+        // Throttled sync diagnostics for audio scheduling (PTS vs base/anchor).
+        // Helps validate SAFE switching + timeline alignment.
+        let n = Int.random(in: 0..<40)
+        if n == 0 {
+            let vClock = currentFileTimeSeconds()
+            PlaybackLog.audio(
+                "[Audio][Schedule] pts=\(String(format: "%.6f", ptsStartSec)) base=\(String(format: "%.6f", base)) " +
+                    "anchor=\(String(format: "%.6f", anchor)) rel=\(String(format: "%.6f", relSec)) " +
+                    "video_clock=\(String(format: "%.6f", vClock)) end=\(String(format: "%.3f", lastAudioScheduledEndSeconds))s"
+            )
+        }
+#endif
         paceAudioSchedulingIfNeeded(outputFormat: outputFormat)
+    }
+
+    // MARK: - SAFE audio track switch (no soft switch)
+
+    /// Fully resets audio scheduling + engine state and performs a seek to the current video clock
+    /// to guarantee a single shared timeline after switching tracks.
+    private func performSafeAudioSwitch(toListIndex listIndex: Int) throws {
+        // STEP 3 requires "current_time = video_clock" (video is master).
+        let videoClock = currentFileTimeSeconds()
+        let anchor = mediaTimelineAnchorValue()
+        PlaybackLog.audio(
+            "[Audio][Switch] begin SAFE switch listIndex=\(listIndex) video_clock=\(String(format: "%.6f", videoClock)) anchor=\(String(format: "%.6f", anchor))"
+        )
+
+        // STEP 1: pause playback (presentation only; keep packet loop running so the seek can refill buffers).
+        DispatchQueue.main.sync { [weak self] in
+            guard let self else { return }
+            self.sampleRenderer.setPlaybackPaused(true)
+            self.audioPlayerNode?.pause()
+        }
+        Task { @MainActor in
+            self.playerState.isPlaying = false
+            self.playerState.isBuffering = true
+        }
+
+        // STEP 2: flush everything (decoder + audio buffers + renderer FIFO).
+        // - Decoder flush is done in `performSeek`, but we also clear scheduling state and tear down the engine here
+        //   to prevent any old buffers from continuing to render after the switch.
+        sampleRenderer.clearQueuedFramesForSeek()
+        sampleRenderer.setDrainSuspended(true)
+
+        audioSessionAnchorPtsSec = nil
+        lastAudioScheduleEndSample = nil
+        audioPlayheadSampleOffset = 0
+        backlogMetricsLock.lock()
+        lastAudioScheduledEndSeconds = 0
+        backlogMetricsLock.unlock()
+
+        DispatchQueue.main.sync { [weak self] in
+            guard let self else { return }
+            // Stop + detach to ensure a clean restart (avoids scheduling into a half-stopped engine).
+            if let node = self.audioPlayerNode {
+                node.stop()
+            }
+            if let engine = self.audioEngine {
+                engine.stop()
+                engine.reset()
+                if let node = self.audioPlayerNode {
+                    engine.detach(node)
+                }
+            }
+            self.audioEngine = nil
+            self.audioPlayerNode = nil
+            self.installedAudioEngineSignature = nil
+        }
+
+        // STEP 4 will reopen the audio decoder for the new stream; ensure we never reuse any old decode state.
+        audioDecoder.close()
+        decoderAudioStreamIndex = -1
+
+        // Apply the new active audio stream before seeking.
+        demuxer.setActiveAudioTrackIndex(listIndex)
+        PlaybackLog.audio("[Audio][Switch] demuxer active streamIndex=\(demuxer.audioStreamIndex) listIndex=\(listIndex)")
+
+        // STEP 3: seek to the current video clock (master timeline).
+        // This also flushes video, updates anchors, and re-enters the post-seek buffering gate.
+        demuxer.interruptBlockingIO()
+        try performSeek(to: videoClock)
+
+        // STEP 6: resume playback (buffering gate will start video+audio atomically when ready).
+        DispatchQueue.main.sync { [weak self] in
+            // Resume the display timebase if it isn't held; if it is held, `releaseTimebaseHold()` will start it.
+            // Do NOT force rate=1 here because post-seek buffering uses `holdTimebase`.
+            self?.sampleRenderer.setDrainSuspended(false)
+            self?.sampleRenderer.requestDrain()
+        }
+        Task { @MainActor in
+            self.playerState.isPlaying = true
+        }
+
+        PlaybackLog.audio(
+            "[Audio][Switch] end SAFE switch seek_target=\(String(format: "%.6f", videoClock)) new_streamIndex=\(demuxer.audioStreamIndex)"
+        )
     }
 
     /// Slows the demux thread when audio is scheduled far ahead of the audible playhead (same timeline as `sampleTime`).
@@ -806,25 +948,11 @@ final class FFmpegPlaybackEngine {
 
         while sessionRunning {
             if let audioListIdx = takePendingAudioTrackListIndexIfAny() {
-                demuxer.setActiveAudioTrackIndex(audioListIdx)
-                PlaybackLog.audio(
-                    "[Audio] demuxer active streamIndex=\(demuxer.audioStreamIndex) listIndex=\(audioListIdx)"
-                )
-                if takePendingAudioReopenForSwitchIfAny(), demuxer.audioStreamIndex >= 0, let ap = demuxer.audioCodecParameters() {
-                    do {
-                        let engineFmt = probePlayerNodeInputFormat()
-                        let aTb = demuxer.audioTimeBase()
-                        try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
-                        decoderAudioStreamIndex = demuxer.audioStreamIndex
-                        audioSessionAnchorPtsSec = nil
-                        lastAudioScheduleEndSample = nil
-                        PlaybackLog.audio("[Audio] soft-switch decoder reopened + schedule reset (no seek)")
-                        if let fmt = audioDecoder.outputFormat {
-                            try installAudioEngine(with: fmt)
-                        }
-                    } catch {
-                        PlaybackLog.audio("[Audio][ERROR] soft-switch reopen failed: \(error.localizedDescription)")
-                    }
+                if takePendingSafeAudioSwitchIfAny() {
+                    try performSafeAudioSwitch(toListIndex: audioListIdx)
+                } else {
+                    // Fallback: if something cleared the flag unexpectedly, still apply the stream index safely via seek.
+                    try performSafeAudioSwitch(toListIndex: audioListIdx)
                 }
             }
             if let seek = takePendingSeekSecondsIfAny() {
@@ -861,6 +989,12 @@ final class FFmpegPlaybackEngine {
                     let sb = try videoDecoder.receiveSampleBuffer(timeBase: demuxer.videoTimeBase())
                     guard let sample = sb else { break }
                     if !sessionRunning { break }
+                    // Establish initial base anchor from first decoded video PTS (PTS-based single source of truth).
+                    if mediaTimelineAnchorValue() == 0, let o = videoDecoder.mediaTimelineOriginSeconds() {
+                        setMediaTimelineAnchor(o)
+                        audioSessionAnchorPtsSec = o
+                        PlaybackLog.sync("[Sync] base anchor set from first video PTS=\(String(format: "%.6f", o))s")
+                    }
                     logVideoFrameIfNeeded(sample)
                     sampleRenderer.pushDecodedFrame(sample)
                 }
@@ -990,18 +1124,12 @@ final class FFmpegPlaybackEngine {
         subtitleDecoder.prepareForSeek()
         PlaybackLog.seek("Decoder flushed (video+audio+subtitle buffers)")
 
+        // Clear any pending interrupt before performing the synchronous seek.
+        demuxer.clearInterrupt()
         try demuxer.seek(toSeconds: seconds, flags: 0)
 
-        if demuxer.videoStreamIndex >= 0, demuxer.audioStreamIndex >= 0 {
-            let vStart = demuxer.streamMediaStartSeconds(streamIndex: demuxer.videoStreamIndex)
-            let aStart = demuxer.streamMediaStartSeconds(streamIndex: demuxer.audioStreamIndex)
-            if let vs = vStart, let aus = aStart {
-                audioScheduleShiftSeconds = max(0, aus - vs)
-                PlaybackLog.audio(
-                    "[Audio] A/V shift recomputed=\(String(format: "%.6f", audioScheduleShiftSeconds))s (video vs audio start)"
-                )
-            }
-        }
+        // Phase 4: keep a single PTS-based timeline; avoid recomputing A/V shift on seek.
+        audioScheduleShiftSeconds = 0
 
         embeddedCueLock.lock()
         embeddedCues.removeAll()
@@ -1020,12 +1148,22 @@ final class FFmpegPlaybackEngine {
         // Audio seek: avoid restarting audio engine on every seek (can cause visible stutter on some devices).
         // Only reopen decoder / reinstall engine when the active audio stream changed (e.g. user switched audio track).
         if demuxer.audioStreamIndex >= 0, demuxer.audioStreamIndex != decoderAudioStreamIndex, let ap = demuxer.audioCodecParameters() {
-            let engineFmt = probePlayerNodeInputFormat()
+            let engineFmt = preferredAudioFormat(for: ap)
             let aTb = demuxer.audioTimeBase()
-            try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
-            decoderAudioStreamIndex = demuxer.audioStreamIndex
-            if let fmt = audioDecoder.outputFormat {
-                try installAudioEngine(with: fmt)
+            do {
+                try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
+                decoderAudioStreamIndex = demuxer.audioStreamIndex
+                if let fmt = audioDecoder.outputFormat {
+                    try installAudioEngine(with: fmt)
+                }
+            } catch {
+                PlaybackLog.audio("[Audio][WARN] multichannel reopen failed; fallback to bus format (\(error.localizedDescription))")
+                let fallbackFmt = probePlayerNodeInputFormat()
+                try audioDecoder.open(codecpar: ap, engineFormat: fallbackFmt, timeBase: aTb)
+                decoderAudioStreamIndex = demuxer.audioStreamIndex
+                if let fmt = audioDecoder.outputFormat {
+                    try installAudioEngine(with: fmt)
+                }
             }
         }
         if subtitleStreamIndex >= 0, let sp = demuxer.codecParameters(streamIndex: subtitleStreamIndex) {
