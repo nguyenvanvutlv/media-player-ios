@@ -17,7 +17,7 @@ struct SettingScreenView : View {
     
     private static let languageOptions: [LanguageOption] = {
         let uiLocale = Locale.current
-        return Locale.isoLanguageCodes
+        return Locale.LanguageCode.isoLanguageCodes.map(\.identifier)
             .compactMap { code in
                 guard let name = uiLocale.localizedString(forLanguageCode: code) else { return nil }
                 return LanguageOption(code: code, displayName: name)
@@ -50,7 +50,7 @@ struct SettingScreenView : View {
     }
     
     @State private var subtitleHasBackground: Bool = true
-    @State private var subtitleUppercased: Bool = false
+    @State private var subtitleBoldEnabled: Bool = false
     
     private let previewBaseText: String = "This is a preview subtitle"
     
@@ -68,6 +68,7 @@ struct SettingScreenView : View {
             String(format: "%.3f", s.fontSize),
             s.textColor,
             s.backgroundColor,
+            s.isBoldEnabled ? "1" : "0",
             String(format: "%.3f", s.position),
             s.preferredLanguage,
             s.isEnabled ? "1" : "0",
@@ -267,13 +268,14 @@ struct SettingScreenView : View {
     }
     
     private var subtitlePreviewText: some View {
-        let displayText = subtitleUppercased ? previewBaseText.uppercased() : previewBaseText
-        
+        let s = subtitleSettings.first
+        let displayText = previewBaseText
+
         return Text(displayText)
             .font(
                 .system(
                     size: 15 * subtitleSizeMultiplier,
-                    weight: .semibold,
+                    weight: (subtitleBoldEnabled || (s?.isBoldEnabled ?? false)) ? .bold : .semibold,
                     design: .rounded
                 )
             )
@@ -432,9 +434,20 @@ struct SettingScreenView : View {
                 )
                 
                 toggleRow(
-                    title: "All caps text",
-                    description: "Transform subtitles to UPPERCASE.",
-                    isOn: $subtitleUppercased
+                    title: "Enable Bold",
+                    description: "Render subtitles with bold + drop shadow (OLED-style).",
+                    isOn: Binding(
+                        get: { subtitleSettings.first?.isBoldEnabled ?? subtitleBoldEnabled },
+                        set: { newValue in
+                            subtitleBoldEnabled = newValue
+                            subtitleSettings.first?.isBoldEnabled = newValue
+                            if newValue {
+                                // OLED-like look: bold + shadow is best with no box background.
+                                subtitleHasBackground = false
+                                subtitleSettings.first?.backgroundColor = "Clear"
+                            }
+                        }
+                    )
                 )
             }
         }
@@ -498,5 +511,6 @@ struct SettingScreenView : View {
 
     private func syncLegacyPreviewStateFromModel() {
         subtitleHasBackground = (subtitleSettings.first?.backgroundColor ?? "Black") != "Clear"
+        subtitleBoldEnabled = subtitleSettings.first?.isBoldEnabled ?? false
     }
 }

@@ -9,6 +9,8 @@ final class SubtitleSettings {
     var textColor: String
     /// Color name for subtitle background (e.g. "Black", "Clear").
     var backgroundColor: String
+    /// When enabled, render subtitles with bold + drop shadow (OLED-style).
+    var isBoldEnabled: Bool
     /// Positive values move subtitles up (adds bottom padding).
     var position: Double
     var preferredLanguage: String
@@ -18,6 +20,7 @@ final class SubtitleSettings {
         fontSize: Double = 18.0,
         textColor: String = "White",
         backgroundColor: String = "Black",
+        isBoldEnabled: Bool = false,
         position: Double = 0.0,
         preferredLanguage: String = Locale.current.language.languageCode?.identifier ?? "en",
         isEnabled: Bool = true
@@ -25,6 +28,7 @@ final class SubtitleSettings {
         self.fontSize = fontSize
         self.textColor = textColor
         self.backgroundColor = backgroundColor
+        self.isBoldEnabled = isBoldEnabled
         self.position = position
         self.preferredLanguage = preferredLanguage
         self.isEnabled = isEnabled

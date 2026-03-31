@@ -11,6 +11,7 @@ private final class BoundedVideoFIFO {
     private var buffers: [CMSampleBuffer] = []
     private let capacity: Int
     private var closed = false
+    private var dropped: Int = 0
 
     init(capacity: Int) {
         self.capacity = max(1, capacity)
@@ -23,6 +24,7 @@ private final class BoundedVideoFIFO {
         guard !closed else { return }
         while buffers.count >= capacity {
             buffers.removeFirst()
+            dropped += 1
         }
         buffers.append(sample)
     }
@@ -38,6 +40,7 @@ private final class BoundedVideoFIFO {
     func clear() {
         lock.lock()
         buffers.removeAll()
+        dropped = 0
         lock.unlock()
     }
 
@@ -45,6 +48,7 @@ private final class BoundedVideoFIFO {
         lock.lock()
         closed = true
         buffers.removeAll()
+        dropped = 0
         lock.unlock()
     }
 
@@ -52,6 +56,7 @@ private final class BoundedVideoFIFO {
         lock.lock()
         closed = false
         buffers.removeAll()
+        dropped = 0
         lock.unlock()
     }
 
@@ -60,11 +65,22 @@ private final class BoundedVideoFIFO {
         defer { lock.unlock() }
         return buffers.count
     }
+
+    func takeAndResetDroppedCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let d = dropped
+        dropped = 0
+        return d
+    }
 }
 
 /// Hosts `AVSampleBufferDisplayLayer` and paces `enqueue` using `requestMediaDataWhenReady` so the queue never runs far ahead of real-time playback.
 final class SampleBufferRenderer {
     let displayLayer = AVSampleBufferDisplayLayer()
+    /// Queue management + enqueue: use renderer on iOS 18+ (layer’s `AVQueuedSampleBufferRendering` API is deprecated).
+    private var videoRenderer: AVSampleBufferVideoRenderer { displayLayer.sampleBufferRenderer }
+    private let displayQueue = DispatchQueue(label: "com.nvv.player.displayLayer.enqueue", qos: .userInteractive)
     private var controlTimebase: CMTimebase?
     private var timelineStarted = false
     /// Prefill a few frames before starting the timebase. This reduces visible stutter/freeze on some devices
@@ -82,8 +98,8 @@ final class SampleBufferRenderer {
     /// The engine sets this during post-seek buffering and clears it via `releaseTimebaseHold()`.
     private var holdTimebase: Bool = false
 
-    /// Bounded queue: 4K NV12 frames are large; cap depth to limit memory while keeping short bursts (was 40).
-    private let fifo = BoundedVideoFIFO(capacity: 28)
+    /// Bounded video frame queue (backpressure): drop oldest on overflow; demux never blocks.
+    private let fifo = BoundedVideoFIFO(capacity: 5)
     private var sessionStopped = true
     private var didInstallMediaRequest = false
     private let requestLock = NSLock()
@@ -130,7 +146,7 @@ final class SampleBufferRenderer {
         drainControlLock.lock()
         drainSuspended = suspended
         drainControlLock.unlock()
-        DispatchQueue.main.async { [weak self] in
+        displayQueue.async { [weak self] in
             guard let self else { return }
             if suspended {
                 self.stopRequestingMediaData()
@@ -147,9 +163,7 @@ final class SampleBufferRenderer {
         if !already { mainDrainScheduled = true }
         requestLock.unlock()
         guard !already else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.drainWhileReady()
-        }
+        displayQueue.async { [weak self] in self?.drainWhileReady() }
     }
 
     /// Safe to call from any thread.
@@ -184,8 +198,8 @@ final class SampleBufferRenderer {
             drainSuspended: suspended,
             isRecoveringFromSeek: recovering,
             isRequestingMediaData: requesting,
-            displayStatus: displayLayer.status,
-            isReadyForMoreMediaData: displayLayer.isReadyForMoreMediaData
+            displayStatus: videoRenderer.status,
+            isReadyForMoreMediaData: videoRenderer.isReadyForMoreMediaData
         )
     }
 
@@ -248,9 +262,7 @@ final class SampleBufferRenderer {
         didEmitFirstFrameForSession = false
         loggedFirstEnqueue = false
         mainDrainScheduled = false
-        DispatchQueue.main.async { [weak self] in
-            self?.drainWhileReady()
-        }
+        displayQueue.async { [weak self] in self?.drainWhileReady() }
     }
 
     private func startRequestingMediaData() {
@@ -259,7 +271,7 @@ final class SampleBufferRenderer {
         if !already { isRequestingMediaData = true }
         requestLock.unlock()
         guard !already else { return }
-        displayLayer.requestMediaDataWhenReady(on: DispatchQueue.main) { [weak self] in
+        videoRenderer.requestMediaDataWhenReady(on: displayQueue) { [weak self] in
             self?.drainWhileReady()
         }
     }
@@ -270,11 +282,11 @@ final class SampleBufferRenderer {
         if was { isRequestingMediaData = false }
         requestLock.unlock()
         guard was else { return }
-        displayLayer.stopRequestingMediaData()
+        videoRenderer.stopRequestingMediaData()
     }
 
     private func drainWhileReady() {
-        // Clear the coalescing flag now that we're on main.
+        // Clear the coalescing flag now that we're on the display enqueue queue.
         requestLock.lock()
         mainDrainScheduled = false
         requestLock.unlock()
@@ -286,8 +298,12 @@ final class SampleBufferRenderer {
         if suspended {
             return
         }
-        if displayLayer.status == .failed {
-            displayLayer.flush()
+        if videoRenderer.status == .failed {
+            videoRenderer.flush()
+        }
+        let droppedNow = fifo.takeAndResetDroppedCount()
+        if droppedNow > 0 {
+            PlaybackLog.backlog("[Render] dropped \(droppedNow) video frame(s) due to FIFO capacity")
         }
         // Avoid blocking the main thread by enqueueing huge bursts in one run,
         // especially right after seek when decode can fill the FIFO quickly.
@@ -299,7 +315,7 @@ final class SampleBufferRenderer {
             return active
         }()
         let maxPerDrain = recovering ? 6 : 8
-        while displayLayer.isReadyForMoreMediaData && enqueued < maxPerDrain {
+        while videoRenderer.isReadyForMoreMediaData && enqueued < maxPerDrain {
             guard let sb = fifo.take() else {
                 // Prevent main-thread callback spin when FIFO is empty.
                 stopRequestingMediaData()
@@ -312,14 +328,14 @@ final class SampleBufferRenderer {
     }
 
     private func enqueueToDisplayLayer(_ sampleBuffer: CMSampleBuffer) {
-        if displayLayer.status == .failed {
-            displayLayer.flush()
+        if videoRenderer.status == .failed {
+            videoRenderer.flush()
         }
         if !timelineStarted {
             // Keep the timebase paused while we prefill a couple frames.
             if prefillRemaining > 0 {
                 prefillRemaining -= 1
-                displayLayer.enqueue(sampleBuffer)
+                videoRenderer.enqueue(sampleBuffer)
                 if prefillRemaining == 0 {
                     timelineStarted = true
                     // Only start playback if the buffering gate is NOT held.
@@ -334,10 +350,10 @@ final class SampleBufferRenderer {
                     try? controlTimebase?.setTime(CMTime.zero)
                     try? controlTimebase?.setRate(1.0)
                 }
-                displayLayer.enqueue(sampleBuffer)
+                videoRenderer.enqueue(sampleBuffer)
             }
         } else {
-            displayLayer.enqueue(sampleBuffer)
+            videoRenderer.enqueue(sampleBuffer)
         }
         recoveryLock.lock()
         if CACurrentMediaTime() < recoveringUntilHostTime {
@@ -359,17 +375,17 @@ final class SampleBufferRenderer {
             didEmitFirstFrameForSession = true
             onFirstFrameEnqueued?()
         }
-        if let err = displayLayer.error {
+        if let err = videoRenderer.error {
             let desc = err.localizedDescription
             if lastLoggedDisplayErrorDescription != desc {
                 lastLoggedDisplayErrorDescription = desc
-                PlaybackLog.displayLayerError("AVSampleBufferDisplayLayer error after enqueue: \(desc) status=\(String(describing: displayLayer.status))")
+                PlaybackLog.displayLayerError("AVSampleBufferDisplayLayer error after enqueue: \(desc) status=\(String(describing: videoRenderer.status))")
             }
         }
     }
 
     func flush() {
-        displayLayer.flushAndRemoveImage()
+        videoRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
     }
 
     func stop() {
@@ -394,7 +410,9 @@ final class SampleBufferRenderer {
 
     func setPlaybackPaused(_ paused: Bool) {
         let rate: Double = paused ? 0 : 1
-        try? controlTimebase?.setRate(rate)
+        displayQueue.async { [weak self] in
+            try? self?.controlTimebase?.setRate(rate)
+        }
     }
 
     /// After seek: drop queued frames but keep the last displayed image visible
@@ -402,7 +420,9 @@ final class SampleBufferRenderer {
     /// replaced when the first new frame arrives after the seek completes.
     func flushForSeek() {
         fifo.clear()
-        displayLayer.flush()
+        displayQueue.async { [weak self] in
+            self?.videoRenderer.flush()
+        }
         holdTimebase = true  // arm the buffering gate
         timelineStarted = false
         prefillRemaining = 2
@@ -429,7 +449,9 @@ final class SampleBufferRenderer {
             try? controlTimebase?.setRate(1.0)
         }
         // Kick off immediate draining so buffered frames reach the display layer now.
-        startRequestingMediaData()
-        drainWhileReady()
+        displayQueue.async { [weak self] in
+            self?.startRequestingMediaData()
+            self?.drainWhileReady()
+        }
     }
 }

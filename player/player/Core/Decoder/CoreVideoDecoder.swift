@@ -19,6 +19,8 @@ final class CoreVideoDecoder {
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var frame: UnsafeMutablePointer<AVFrame>?
     private var sws: UnsafeMutableRawPointer?
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var pixelBufferPoolKey: (w: Int32, h: Int32, format: OSType)?
 
     private var dstPixFmt: AVPixelFormat = AV_PIX_FMT_NONE
     private var lastWidth: Int32 = 0
@@ -205,6 +207,8 @@ final class CoreVideoDecoder {
             ff_sws_free(s)
             sws = nil
         }
+        pixelBufferPool = nil
+        pixelBufferPoolKey = nil
         if frame != nil {
             av_frame_free(&frame)
         }
@@ -313,11 +317,9 @@ final class CoreVideoDecoder {
     private func makeSampleBufferViaSwscale(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) throws -> CMSampleBuffer? {
         let streamLooksHDR = isHDRish(frame: frame)
         #if targetEnvironment(simulator)
-        let prefer10BitOutput = false
+        return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: false)
         #else
-        let prefer10BitOutput = true
-        #endif
-        if streamLooksHDR, prefer10BitOutput {
+        if streamLooksHDR {
             do {
                 return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: true)
             } catch CoreVideoDecoderError.pixelBufferFailed {
@@ -325,6 +327,7 @@ final class CoreVideoDecoder {
             }
         }
         return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: false)
+        #endif
     }
 
     private func makeSampleBufferViaSwscale(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational, hdrOutput: Bool) throws -> CMSampleBuffer? {
@@ -342,8 +345,9 @@ final class CoreVideoDecoder {
                 ff_sws_free(s)
                 sws = nil
             }
-            // SWS_FAST_BILINEAR (1) is noticeably cheaper than SWS_BILINEAR (2) for large 4K frames on CPU.
-            let swsFlags: Int32 = hdrOutput ? 2 : 1
+            // SWS_FAST_BILINEAR (1) is noticeably cheaper than SWS_BILINEAR (2) for large frames on CPU.
+            // Prefer it even for HDR output to reduce stutter on software decode paths.
+            let swsFlags: Int32 = 1
             sws = ff_sws_get_context(
                 Int32(w), Int32(h), srcFmt.rawValue,
                 Int32(w), Int32(h), dst.rawValue,
@@ -355,23 +359,100 @@ final class CoreVideoDecoder {
             dstPixFmt = dst
         }
         guard let swsCtx = sws else { throw CoreVideoDecoderError.openFailed(code: -1) }
-
-        var dstFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        guard let dstF = dstFrame else { throw CoreVideoDecoderError.allocateFrameFailed }
-        defer { av_frame_free(&dstFrame) }
-
-        dstF.pointee.format = Int32(dst.rawValue)
-        dstF.pointee.width = w
-        dstF.pointee.height = h
-        var bufRet = av_frame_get_buffer(dstF, 32)
-        if bufRet < 0 { throw CoreVideoDecoderError.openFailed(code: bufRet) }
-
-        bufRet = Int32(ff_sws_scale(swsCtx, frame, dstF))
-        if bufRet < 0 { throw CoreVideoDecoderError.openFailed(code: bufRet) }
-
-        let pb = try createCVPixelBuffer(from: dstF, format: cvFormat, is10Bit: hdrOutput)
+        let pb = try obtainPixelBufferFromPool(width: w, height: h, format: cvFormat)
+        let scaleRet = try swsScaleIntoPixelBuffer(
+            swsCtx: swsCtx,
+            srcFrame: frame,
+            dstPixelBuffer: pb,
+            dstIs10Bit: hdrOutput
+        )
+        if scaleRet < 0 { throw CoreVideoDecoderError.openFailed(code: Int32(scaleRet)) }
         attachHDRMetadata(to: pb, frame: frame)
         return try wrapPixelBuffer(pb, frame: frame, timeBase: timeBase)
+    }
+
+    private func obtainPixelBufferFromPool(width: Int32, height: Int32, format: OSType) throws -> CVPixelBuffer {
+        if pixelBufferPool == nil
+            || pixelBufferPoolKey?.w != width
+            || pixelBufferPoolKey?.h != height
+            || pixelBufferPoolKey?.format != format
+        {
+            let pbAttrs: [CFString: Any] = [
+                kCVPixelBufferWidthKey: Int(width),
+                kCVPixelBufferHeightKey: Int(height),
+                kCVPixelBufferPixelFormatTypeKey: Int(format),
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey: true,
+            ]
+            var pool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, pbAttrs as CFDictionary, &pool)
+            guard status == kCVReturnSuccess, let created = pool else {
+                throw CoreVideoDecoderError.pixelBufferFailed
+            }
+            pixelBufferPool = created
+            pixelBufferPoolKey = (w: width, h: height, format: format)
+        }
+        guard let pool = pixelBufferPool else { throw CoreVideoDecoderError.pixelBufferFailed }
+        var pb: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+        guard status == kCVReturnSuccess, let out = pb else {
+            throw CoreVideoDecoderError.pixelBufferFailed
+        }
+        return out
+    }
+
+    private func swsScaleIntoPixelBuffer(
+        swsCtx: UnsafeMutableRawPointer,
+        srcFrame: UnsafeMutablePointer<AVFrame>,
+        dstPixelBuffer: CVPixelBuffer,
+        dstIs10Bit: Bool
+    ) throws -> Int {
+        let lockStatus = CVPixelBufferLockBaseAddress(dstPixelBuffer, [])
+        guard lockStatus == kCVReturnSuccess else { throw CoreVideoDecoderError.pixelBufferFailed }
+        defer { CVPixelBufferUnlockBaseAddress(dstPixelBuffer, []) }
+
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(dstPixelBuffer, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(dstPixelBuffer, 1)
+        else {
+            throw CoreVideoDecoderError.pixelBufferFailed
+        }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(dstPixelBuffer, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(dstPixelBuffer, 1)
+
+        var dstPlanes: [UnsafeMutablePointer<UInt8>?] = [
+            yBase.assumingMemoryBound(to: UInt8.self),
+            uvBase.assumingMemoryBound(to: UInt8.self),
+            nil,
+            nil,
+        ]
+        var dstStrides: [Int32] = [Int32(yStride), Int32(uvStride), 0, 0]
+
+        var srcPlanes: [UnsafePointer<UInt8>?] = [
+            UnsafePointer(srcFrame.pointee.data.0),
+            UnsafePointer(srcFrame.pointee.data.1),
+            UnsafePointer(srcFrame.pointee.data.2),
+            UnsafePointer(srcFrame.pointee.data.3),
+        ]
+        var srcStrides: [Int32] = [
+            srcFrame.pointee.linesize.0,
+            srcFrame.pointee.linesize.1,
+            srcFrame.pointee.linesize.2,
+            srcFrame.pointee.linesize.3,
+        ]
+
+        _ = dstIs10Bit
+
+        return Int(
+            ff_sws_scale_planes(
+                swsCtx,
+                &srcPlanes,
+                &srcStrides,
+                0,
+                Int32(srcFrame.pointee.height),
+                &dstPlanes,
+                &dstStrides
+            )
+        )
     }
 
     private func isHDRish(frame: UnsafeMutablePointer<AVFrame>) -> Bool {
@@ -433,19 +514,15 @@ final class CoreVideoDecoder {
         let srcY = frame.pointee.data.0!
         let srcYStride = frame.pointee.linesize.0
 
-        if is10Bit {
-            for row in 0..<h {
-                let srcRow = srcY.advanced(by: row * Int(srcYStride))
-                let dstRow = yDest.advanced(by: row * yStride).assumingMemoryBound(to: UInt16.self)
-                let src16 = UnsafeRawPointer(srcRow).assumingMemoryBound(to: UInt16.self)
-                for x in 0..<w {
-                    dstRow[x] = src16[x]
-                }
-            }
-        } else {
-            for row in 0..<h {
-                memcpy(yDest.advanced(by: row * yStride), srcY.advanced(by: row * Int(srcYStride)), w)
-            }
+        // NOTE: This copy sits on the hot video path in software decode mode.
+        // Use `memcpy` per-row (not per-pixel loops) to reduce CPU overhead for large frames.
+        let yRowBytes = is10Bit ? (w * 2) : w
+        for row in 0..<h {
+            memcpy(
+                yDest.advanced(by: row * yStride),
+                srcY.advanced(by: row * Int(srcYStride)),
+                min(yStride, yRowBytes)
+            )
         }
 
         guard let uvDest = CVPixelBufferGetBaseAddressOfPlane(pb, 1) else { return }
@@ -453,19 +530,13 @@ final class CoreVideoDecoder {
         let srcUV = frame.pointee.data.1!
         let srcUVStride = frame.pointee.linesize.1
         let uvRows = h / 2
-        if is10Bit {
-            for row in 0..<uvRows {
-                let srcRow = srcUV.advanced(by: row * Int(srcUVStride))
-                let dstRow = uvDest.advanced(by: row * uvStride).assumingMemoryBound(to: UInt16.self)
-                let src16 = UnsafeRawPointer(srcRow).assumingMemoryBound(to: UInt16.self)
-                for x in 0..<w {
-                    dstRow[x] = src16[x]
-                }
-            }
-        } else {
-            for row in 0..<uvRows {
-                memcpy(uvDest.advanced(by: row * uvStride), srcUV.advanced(by: row * Int(srcUVStride)), w)
-            }
+        let uvRowBytes = is10Bit ? (w * 2) : w
+        for row in 0..<uvRows {
+            memcpy(
+                uvDest.advanced(by: row * uvStride),
+                srcUV.advanced(by: row * Int(srcUVStride)),
+                min(uvStride, uvRowBytes)
+            )
         }
     }
 

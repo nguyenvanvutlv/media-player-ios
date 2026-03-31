@@ -19,7 +19,12 @@ enum DefaultSubtitleBitmapBackend: SubtitleBitmapBackend {
             assRaw: assRaw,
             maxWidth: maxWidth,
             displayScale: displayScale,
-            style: .init(fontSize: 18, textColor: .white, backgroundColor: UIColor.black.withAlphaComponent(0.45))
+            style: .init(
+                fontSize: 18,
+                textColor: .white,
+                backgroundColor: UIColor.black.withAlphaComponent(0.45),
+                isBoldEnabled: false
+            )
         )
     }
 }

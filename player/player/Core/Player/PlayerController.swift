@@ -16,7 +16,8 @@ final class PlayerController {
     private var subtitleStyle = SubtitleBitmapRenderer.Style(
         fontSize: 18,
         textColor: .white,
-        backgroundColor: UIColor.black.withAlphaComponent(0.45)
+        backgroundColor: UIColor.black.withAlphaComponent(0.45),
+        isBoldEnabled: false
     )
     private var subtitlesEnabled = true
     private var lastSubtitleNoFrameLogTime: Double?
@@ -24,6 +25,7 @@ final class PlayerController {
     private var lastSubtitleStatusLogTime: Double?
     private var pendingSubtitleDebounceWork: DispatchWorkItem?
     private var lastSubtitleRenderedAt: CFTimeInterval?
+    private let subtitleRenderQueue = DispatchQueue(label: "com.nvv.player.subtitle.render", qos: .userInitiated)
 
     var sampleRenderer: SampleBufferRenderer { engine.sampleRenderer }
 
@@ -59,12 +61,14 @@ final class PlayerController {
         textColor: UIColor,
         backgroundColor: UIColor?,
         position: Double,
-        isEnabled: Bool
+        isEnabled: Bool,
+        isBoldEnabled: Bool
     ) {
         subtitleStyle = SubtitleBitmapRenderer.Style(
             fontSize: CGFloat(fontSize),
             textColor: textColor,
-            backgroundColor: backgroundColor
+            backgroundColor: backgroundColor,
+            isBoldEnabled: isBoldEnabled
         )
         subtitlesEnabled = isEnabled
         state.subtitleOverlayVerticalOffset = position
@@ -257,26 +261,50 @@ final class PlayerController {
         lastSubtitleRenderedAt = now
         PlaybackLog.renderSubtitle(ptsMediaSeconds: currentTime, text: frame.plainText)
 
-        if let img = SubtitleBitmapRenderer.render(
-            plainText: frame.plainText,
-            assRaw: frame.assRaw,
-            maxWidth: w,
-            displayScale: scale,
-            style: subtitleStyle
-        ) {
-            state.subtitleOverlayImage = img
-            let sz = img.size
-            PlaybackLog.subtitleOverlayRender(
-                ptsMs: frame.ptsMs,
-                width: Int(sz.width * scale),
-                height: Int(sz.height * scale),
-                hasImage: true,
-                backend: "CoreGraphics"
+        // Render subtitles off the main thread to avoid UI hitches that can manifest as "video stutter".
+        let renderSig = sig
+        let renderText = frame.plainText
+        let renderAss = frame.assRaw
+        let renderPtsMs = frame.ptsMs
+        let renderMaxWidth = w
+        let renderScale = scale
+        let renderStyle = subtitleStyle
+        subtitleRenderQueue.async { [weak self] in
+            guard let self else { return }
+            let img = SubtitleBitmapRenderer.render(
+                plainText: renderText,
+                assRaw: renderAss,
+                maxWidth: renderMaxWidth,
+                displayScale: renderScale,
+                style: renderStyle
             )
-            PlaybackLog.subtitleOverlayLayer(sizeWidth: Int(sz.width * scale), sizeHeight: Int(sz.height * scale))
-        } else {
-            state.subtitleOverlayImage = nil
-            PlaybackLog.subtitleOverlayRender(ptsMs: frame.ptsMs, width: 0, height: 0, hasImage: false, backend: "CoreGraphics")
+            Task { @MainActor in
+                // Drop stale work if a newer subtitle/frame/style was selected.
+                guard self.lastSubtitleOverlaySignature == renderSig else { return }
+                self.state.subtitleOverlayImage = img
+                if let img {
+                    let sz = img.size
+                    PlaybackLog.subtitleOverlayRender(
+                        ptsMs: renderPtsMs,
+                        width: Int(sz.width * renderScale),
+                        height: Int(sz.height * renderScale),
+                        hasImage: true,
+                        backend: "CoreGraphics"
+                    )
+                    PlaybackLog.subtitleOverlayLayer(
+                        sizeWidth: Int(sz.width * renderScale),
+                        sizeHeight: Int(sz.height * renderScale)
+                    )
+                } else {
+                    PlaybackLog.subtitleOverlayRender(
+                        ptsMs: renderPtsMs,
+                        width: 0,
+                        height: 0,
+                        hasImage: false,
+                        backend: "CoreGraphics"
+                    )
+                }
+            }
         }
     }
 }

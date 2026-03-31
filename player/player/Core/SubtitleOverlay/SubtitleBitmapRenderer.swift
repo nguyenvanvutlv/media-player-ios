@@ -7,6 +7,7 @@ enum SubtitleBitmapRenderer {
         var fontSize: CGFloat
         var textColor: UIColor
         var backgroundColor: UIColor?
+        var isBoldEnabled: Bool
     }
 
     /// - Parameters:
@@ -22,7 +23,10 @@ enum SubtitleBitmapRenderer {
         let text = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
 
-        let font = UIFont.systemFont(ofSize: max(10, style.fontSize), weight: .semibold)
+        let font = UIFont.systemFont(
+            ofSize: max(10, style.fontSize),
+            weight: style.isBoldEnabled ? .bold : .semibold
+        )
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
         paragraph.lineBreakMode = .byWordWrapping
@@ -30,23 +34,32 @@ enum SubtitleBitmapRenderer {
         let maxW = max(60, maxWidth - 48)
         let constraint = CGSize(width: maxW, height: CGFloat.greatestFiniteMagnitude)
 
-        let strokeAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .paragraphStyle: paragraph,
-            .strokeColor: UIColor.black,
-            .strokeWidth: -4.0,
-            .foregroundColor: UIColor.clear,
-        ]
         let fillAttrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .paragraphStyle: paragraph,
             .foregroundColor: style.textColor,
         ]
-
-        let strokeStr = NSAttributedString(string: text, attributes: strokeAttrs)
         let fillStr = NSAttributedString(string: text, attributes: fillAttrs)
 
-        let textBounds = strokeStr.boundingRect(with: constraint, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+        // For sizing, account for either outline stroke (default) or drop-shadow (bold mode).
+        let measureAttrs: [NSAttributedString.Key: Any] = {
+            if style.isBoldEnabled {
+                return fillAttrs
+            }
+            return [
+                .font: font,
+                .paragraphStyle: paragraph,
+                .strokeColor: UIColor.black,
+                .strokeWidth: -4.0,
+                .foregroundColor: UIColor.clear,
+            ]
+        }()
+        let measureStr = NSAttributedString(string: text, attributes: measureAttrs)
+        let textBounds = measureStr.boundingRect(
+            with: constraint,
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        )
         let pad: CGFloat = 14
         let bgCorner: CGFloat = 6
         let size = CGSize(
@@ -73,8 +86,29 @@ enum SubtitleBitmapRenderer {
                 width: size.width - pad * 2,
                 height: size.height - pad * 2
             )
-            strokeStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
-            fillStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+            if style.isBoldEnabled {
+                // Media3-like: bold text with drop shadow on transparent background.
+                let cg = ctx.cgContext
+                cg.saveGState()
+                cg.setShadow(
+                    offset: CGSize(width: 0, height: 2),
+                    blur: 4,
+                    color: UIColor.black.withAlphaComponent(0.9).cgColor
+                )
+                fillStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+                cg.restoreGState()
+            } else {
+                let strokeAttrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .paragraphStyle: paragraph,
+                    .strokeColor: UIColor.black,
+                    .strokeWidth: -4.0,
+                    .foregroundColor: UIColor.clear,
+                ]
+                let strokeStr = NSAttributedString(string: text, attributes: strokeAttrs)
+                strokeStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+                fillStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+            }
         }
 
         _ = assRaw // reserved for libass-backed renderer

@@ -305,4 +305,38 @@ enum PlaybackLog {
         print(message)
 #endif
     }
+
+    // MARK: - Pipeline sync debug (Step 8)
+
+    /// A/V sync drift diagnostic (video decode loop, throttled to ~2Hz).
+    static func syncDrift(audioClockSec: Double, videoPtsSec: Double, diffMs: Double) {
+#if DEBUG
+        let msg = String(
+            format: "[Sync][drift] audio=%.3fs video=%.3fs Δ=%.1fms",
+            audioClockSec, videoPtsSec, diffMs
+        )
+        syncLog.info("\(msg, privacy: .public)")
+#else
+        _ = audioClockSec; _ = videoPtsSec; _ = diffMs
+#endif
+    }
+
+    /// Drift alert: emitted when |drift| > 100ms.
+    static func driftAlert(diffMs: Double) {
+        let msg = String(format: "[Sync][ALERT] A/V drift=%.1fms (>100ms threshold)", diffMs)
+        syncLog.warning("\(msg, privacy: .public)")
+#if DEBUG
+        NSLog("%@", msg)
+#endif
+    }
+
+    /// Decode path diagnostic: hardware vs software, resolution. Emitted once per session.
+    static func decodePath(format: String, isHardware: Bool, resolution: String) {
+        let hw = isHardware ? "hardware" : "software"
+        let msg = "[Decode] path=\(hw) format=\(format) resolution=\(resolution)"
+        videoLog.info("\(msg, privacy: .public)")
+#if DEBUG
+        NSLog("%@", msg)
+#endif
+    }
 }

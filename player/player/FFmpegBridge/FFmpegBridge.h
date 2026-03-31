@@ -1,3 +1,6 @@
+// Basic integer types used by the bridge.
+#include <stdint.h>
+
 struct AVFrame;
 struct AVCodecContext;
 struct AVCodec;
@@ -10,6 +13,16 @@ int ff_err_eagain(void);
 int ff_err_enomem(void);
 int ff_err_eof(void);
 int ff_sws_scale(void *c, struct AVFrame *src, struct AVFrame *dst);
+/// Direct swscale into pre-allocated destination planes (avoids intermediate AVFrame allocations/copies).
+int ff_sws_scale_planes(
+    void *c,
+    const uint8_t *const srcSlice[],
+    const int srcStride[],
+    int srcSliceY,
+    int srcSliceH,
+    uint8_t *const dst[],
+    const int dstStride[]
+);
 int ff_swr_convert_interleaved_flt(void *swr, float *out, int out_samples_per_channel, struct AVFrame *frame);
 int ff_swr_convert_planar_flt(void *swr, void *out_planes, int out_samples_per_channel, struct AVFrame *frame);
 void *ff_sws_get_context(int srcW, int srcH, int srcFmt, int dstW, int dstH, int dstFmt, int flags);

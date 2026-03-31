@@ -33,6 +33,7 @@ struct PlayerView: View {
             String(format: "%.3f", s.fontSize),
             s.textColor,
             s.backgroundColor,
+            s.isBoldEnabled ? "1" : "0",
             String(format: "%.3f", s.position),
             s.preferredLanguage,
             s.isEnabled ? "1" : "0",
@@ -139,7 +140,7 @@ struct PlayerView: View {
                 onPickSubtitle: { picked in
                     // Selecting a subtitle track implies enabling subtitle rendering.
                     // Persist this to SwiftData so the controller doesn't early-return with `enabled=false`.
-                    if picked ?? 0 > 0 {
+                    if picked > 0 {
                         ensureSubtitleSettingsRow()
                         subtitleSettings.first?.isEnabled = true
                         try? modelContext.save()
@@ -200,7 +201,8 @@ struct PlayerView: View {
             textColor: uiTextColor,
             backgroundColor: uiBackgroundColor,
             position: s.position,
-            isEnabled: s.isEnabled
+            isEnabled: s.isEnabled,
+            isBoldEnabled: s.isBoldEnabled
         )
     }
 

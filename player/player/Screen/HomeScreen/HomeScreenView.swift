@@ -10,7 +10,7 @@ import SwiftUI
 struct HomeScreenView : View {
     var onSubmit: (URL) -> Void = { _ in }
     
-    @State private var urlText: String = "https://dl-a10b-1531.mypikpak.com/download/?fid=T5qqLWD9kE8TT0wY7rX5n0uglEncrRO6ziXT0JA37NrfmqiPqwewHUypxKysIpFilMsiRL94w2RDItusIw79MWDoZzT-vUu_tJ2oJhKlEDU=&from=5&verno=3&prod=pikpak&expire=1774969542&g=49F7D275806B2A35736D3E325F13EAA06C9497D0&ui=aJgD4HNLZR8dbfo1&t=0&ms=50400000&th=50400000&f=4653197120&alt=0&us=0&hspu=&po=0&userid=aJgD4HNLZR8dbfo1&fileid=VOZ5-uRaCpHuqpbexxM_sDZBo2&pr=XQPkPvr9WWiIuMvELmrVeiVrimPICTTkfb5hL2-1k6dDw3Epqy3z5q6GyA1eEsVrMO3xKu8JkavWwY_3MW9lHmuyII8TbMLaPv91lr8HZp4XwN-HTlhdpKBVrptWj8vzw2PV3_rF4hV9mvEY1q2C3h6v00lHSkjRpldMOUqNO31Eii4wy9hkZJ9C8h2auy9kI1C_zXKPlyTc4xzDVBiKW3wJIOpsOfj1zgJbGTWZjd60LgLnyxFHQh4w1vTBOnuxLhqE_fukAzrPx4WcfZEDK6RMuURPmUj5mKHvCj0ZmlzYpi0cjnaOfM2GmL3PV9-HL7-JPUTifPiE0AU8NHq47BwqtJRLqYBqBxOmNNssUBofy6awhtsqTE26s1U82zmeKFzpXktXt46PgwYid62fP_ee_aX3FfDyoKDxkGol_Xajf70OYWUHCzeYQjJCCiAC&sign=178E7C40C6F9FF685DCFF4B720ECB66F"
+    @State private var urlText: String = "https://dl-a10b-0861.mypikpak.com/download/?fid=7mHRfmErQmsrxc_4j7d0ejFN7sgBbK2U7NG6J6x6WUSHy6UVqzjZ46D60xFXeVIRFyGQvs_w60cYprqrbFOKA2DoZzT-vUu_tJ2oJhKlEDU=&from=5&verno=3&prod=pikpak&expire=1774999511&g=E25F8E8C426D6E28013CEA1AC3CB9B03E78213E0&ui=aJgD4HNLZR8dbfo1&t=0&ms=50400000&th=50400000&f=3900728831&alt=0&us=0&hspu=&po=0&fileid=VOa08T9BtvuA9Gis5y77-wJGo2&userid=aJgD4HNLZR8dbfo1&pr=XQPkPvr9WWiIuMvELmrVer-JBwE_ShPUAH80FWw5HGCFVqdsYTLfUw4kvBzBZxh0co607AB-z4HXcRJR7FgR7SrKNhAbMidFi8CAf9q714Fp3HhWqOeyrJqIwGHVITcViChbA632TCIGN2xCqZpZxB6v00lHSkjRpldMOUqNO31Eii4wy9hkZJ9C8h2auy9kI1C_zXKPlyTc4xzDVBiKW3Y7nM2J2JUBAnjTV-ux0TQ86QPbIX1Mg6TR9ZnUgBtbxQ37Bk0-BmuSY22KExbyqWfM2EASDW6AWRNQt9Iqub8Pi4UEyvSBxvPL-RlfI7rUyNRaSMAV9yAW-qMo5m51v2Dro9-WjTltC31-SCqzb0Zk8DItg5o2igSxNvgk2VLUrnLPGlCbqX4Lf4GdUDhLekmf_wBLH8PgPEhZ1vszJa9NyysGYZFGusCMeUg7DzVZ&sign=926C46462097926697AFB8A734BC39B5"
     @State private var showInvalidURLAlert: Bool = false
     
     var body: some View {
@@ -19,7 +19,6 @@ struct HomeScreenView : View {
                 .ignoresSafeArea()
             
             VStack(spacing: 32) {
-                // Header
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Media Player")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
@@ -33,7 +32,6 @@ struct HomeScreenView : View {
                 .padding(.horizontal, 24)
                 .padding(.top, 8)
                 
-                // URL Input Card
                 VStack(spacing: 18) {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Source URL")
@@ -45,7 +43,7 @@ struct HomeScreenView : View {
                                 .font(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.6))
                             
-                            TextField("https://example.com/video.m3u8", text: $urlText)
+                            TextField("", text: $urlText)
                                 .keyboardType(.URL)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
@@ -64,7 +62,6 @@ struct HomeScreenView : View {
                         )
                     }
                     
-                    // Helper text
                     HStack(spacing: 6) {
                         Circle()
                             .fill(Color.green)
@@ -90,7 +87,6 @@ struct HomeScreenView : View {
                 
                 Spacer()
                 
-                // Play button + secondary actions
                 VStack(spacing: 16) {
                     Button(action: {
                         submitIfPossible()

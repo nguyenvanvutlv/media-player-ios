@@ -1,3 +1,7 @@
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdocumentation"
+#pragma clang diagnostic ignored "-Wdocumentation-html"
+
 #include <libavutil/error.h>
 #include <libavutil/time.h>
 #include <errno.h>
@@ -11,6 +15,8 @@
 
 // Local declarations shared with Swift via header.
 #include "FFmpegBridge.h"
+
+#pragma clang diagnostic pop
 
 static enum AVPixelFormat ff_get_format_videotoolbox(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
 {
@@ -61,6 +67,26 @@ int ff_sws_scale(void *c, AVFrame *src, AVFrame *dst) {
                      (const uint8_t *const *)src->data, src->linesize,
                      0, src->height,
                      (uint8_t *const *)dst->data, dst->linesize);
+}
+
+int ff_sws_scale_planes(
+    void *c,
+    const uint8_t *const srcSlice[],
+    const int srcStride[],
+    int srcSliceY,
+    int srcSliceH,
+    uint8_t *const dst[],
+    const int dstStride[]
+) {
+    return sws_scale(
+        (struct SwsContext *)c,
+        srcSlice,
+        srcStride,
+        srcSliceY,
+        srcSliceH,
+        dst,
+        dstStride
+    );
 }
 
 int ff_swr_convert_interleaved_flt(void *swr, float *out, int out_samples_per_channel, AVFrame *frame) {
