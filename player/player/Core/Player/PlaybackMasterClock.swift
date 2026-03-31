@@ -58,7 +58,15 @@ final class PlaybackMasterClock {
         lock.lock()
         anchorMediaSeconds = anchor
         let srClamped = max(8000, sr)
-        guard let node, let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else {
+        guard let node else {
+            lock.unlock()
+            return
+        }
+        guard let engine = node.engine, engine.isRunning else {
+            lock.unlock()
+            return
+        }
+        guard let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else {
             lock.unlock()
             return
         }
@@ -75,7 +83,15 @@ final class PlaybackMasterClock {
         lock.lock()
         anchorMediaSeconds = anchor
         let srClamped = max(8000, sr)
-        guard let node, let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else {
+        guard let node else {
+            lock.unlock()
+            return
+        }
+        guard let engine = node.engine, engine.isRunning else {
+            lock.unlock()
+            return
+        }
+        guard let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else {
             lock.unlock()
             return
         }

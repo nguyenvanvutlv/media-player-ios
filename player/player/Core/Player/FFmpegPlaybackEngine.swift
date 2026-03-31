@@ -57,6 +57,10 @@ final class FFmpegPlaybackEngine {
     private var pendingAudioTrackListIndex: Int?
     /// When true, reopen audio decoder/engine for the newly selected stream without forcing a seek.
     private var pendingAudioReopenForSwitch = false
+    /// Set during audio track switching. When true, decode-side code must not touch `AVAudioPlayerNode` playhead APIs
+    /// (`lastRenderTime` / `playerTime`) to avoid AVFAudio internal asserts during engine teardown/rebuild.
+    private var audioSwitchInProgress = false
+    private let audioSwitchLock = NSLock()
     private let playbackStateLock = NSLock()
     private let timelineLock = NSLock()
     private var mediaTimelineAnchor: Double = 0
@@ -92,6 +96,35 @@ final class FFmpegPlaybackEngine {
         timelineLock.lock()
         defer { timelineLock.unlock() }
         return suppressDisplayLinkTicks
+    }
+
+    // MARK: - Seek barrier (prevents decode scheduling before anchor is applied)
+    private let seekBarrierLock = NSLock()
+    private var seekAnchorPending = false
+    private var postSeekTargetSeconds: Double?
+
+    private func setSeekAnchorPending(_ value: Bool) {
+        seekBarrierLock.lock()
+        seekAnchorPending = value
+        seekBarrierLock.unlock()
+    }
+
+    private func isSeekAnchorPending() -> Bool {
+        seekBarrierLock.lock()
+        defer { seekBarrierLock.unlock() }
+        return seekAnchorPending
+    }
+
+    private func setPostSeekTargetSeconds(_ value: Double?) {
+        seekBarrierLock.lock()
+        postSeekTargetSeconds = value
+        seekBarrierLock.unlock()
+    }
+
+    private func currentPostSeekTargetSeconds() -> Double? {
+        seekBarrierLock.lock()
+        defer { seekBarrierLock.unlock() }
+        return postSeekTargetSeconds
     }
 
     // MARK: - Seek / scrub / pause (thread-safe; packet loop runs on playback queue without yielding)
@@ -215,6 +248,18 @@ final class FFmpegPlaybackEngine {
         let v = pendingSubtitleApplyIndex
         pendingSubtitleApplyIndex = nil
         return v
+    }
+
+    private func setAudioSwitchInProgress(_ value: Bool) {
+        audioSwitchLock.lock()
+        audioSwitchInProgress = value
+        audioSwitchLock.unlock()
+    }
+
+    private func isAudioSwitchInProgress() -> Bool {
+        audioSwitchLock.lock()
+        defer { audioSwitchLock.unlock() }
+        return audioSwitchInProgress
     }
 
     private func setPendingSubtitleApplyIndex(_ value: Int?) {
@@ -959,6 +1004,8 @@ final class FFmpegPlaybackEngine {
         _ buffer: AVAudioPCMBuffer, ptsStartSec: Double, outputFormat: AVAudioFormat
     ) {
         guard let node = audioPlayerNode else { return }
+        if isAudioSwitchInProgress() { return }
+        guard let engine = node.engine, engine.isRunning else { return }
         // Use the same base as the UI/video timeline (mediaTimelineAnchor).
         // If the anchor hasn't been established yet (pre-first-video-frame),
         // fall back to the first audio PTS as a temporary base.
@@ -969,6 +1016,14 @@ final class FFmpegPlaybackEngine {
         } else {
             if audioSessionAnchorPtsSec == nil { audioSessionAnchorPtsSec = ptsStartSec }
             base = audioSessionAnchorPtsSec!
+        }
+        // Post-seek: drop any PCM that belongs to the old timeline.
+        // If we clamp negative relSec to 0, pre-seek audio can be heard right after seek (A/V desync).
+        if postSeekBuffering {
+            let epsilon = 0.03
+            if ptsStartSec < (base - epsilon) {
+                return
+            }
         }
         var relSec = (ptsStartSec - base) + audioScheduleShiftSeconds
         if relSec < 0 { relSec = 0 }
@@ -1008,6 +1063,10 @@ final class FFmpegPlaybackEngine {
     private func paceAudioSchedulingIfNeeded(outputFormat: AVAudioFormat) {
         guard sessionRunning, let node = audioPlayerNode, let end = lastAudioScheduleEndSample
         else { return }
+        if isAudioSwitchInProgress() { return }
+        // `AVAudioPlayerNode.lastRenderTime/playerTime` will assert internally if the node was
+        // detached from its engine during teardown/rebuild.
+        guard let engine = node.engine, engine.isRunning else { return }
         let sr = outputFormat.sampleRate
         let scheduledEndSec = Double(end) / sr
         let now = CACurrentMediaTime()
@@ -1016,6 +1075,9 @@ final class FFmpegPlaybackEngine {
         seekRecoveryLock.unlock()
         let aheadLimit = recoveringAudio ? 0.6 : maxAudioScheduledAheadSeconds
 
+        // Re-check right before we touch playhead APIs to minimize the race window.
+        if isAudioSwitchInProgress() { return }
+        guard let engine = node.engine, engine.isRunning else { return }
         if let nodeTime = node.lastRenderTime,
             let playerTime = node.playerTime(forNodeTime: nodeTime)
         {
@@ -1096,6 +1158,11 @@ final class FFmpegPlaybackEngine {
                 let oldStream = demuxer.audioStreamIndex
                 let oldListIdx = demuxer.activeAudioTrackListIndex()
                 let switchAt = currentPlaybackMediaSeconds()
+
+                setAudioSwitchInProgress(true)
+                // During teardown/rebuild, avoid using the audio-driven clock (prevents node playhead reads).
+                hasActiveAudioStreamForClock = false
+                defer { setAudioSwitchInProgress(false) }
 
                 PlaybackLog.audio(
                     String(
@@ -1294,6 +1361,10 @@ final class FFmpegPlaybackEngine {
             }
 
             while sessionRunning && !hasPendingSeekRequest() {
+                if isSeekAnchorPending() {
+                    Thread.sleep(forTimeInterval: 0.001)
+                    continue
+                }
                 let sb: CMSampleBuffer?
                 do {
                     sb = try videoDecoder.receiveSampleBuffer(timeBase: vTimeBase)
@@ -1349,6 +1420,10 @@ final class FFmpegPlaybackEngine {
             }
 
             while sessionRunning && !hasPendingSeekRequest() {
+                if isSeekAnchorPending() {
+                    Thread.sleep(forTimeInterval: 0.001)
+                    continue
+                }
                 let result: (AVAudioPCMBuffer, Double)?
                 do {
                     result = try audioDecoder.receivePCM()
@@ -1361,12 +1436,14 @@ final class FFmpegPlaybackEngine {
                 scheduleAudioBuffer(buffer, ptsStartSec: ptsStartSec, outputFormat: fmt)
 
                 // Update master clock from actual playhead on decode thread.
-                masterClock.updateFromDecodeThread(
-                    node: audioPlayerNode,
-                    anchor: mediaTimelineAnchorValue(),
-                    offset: audioPlayheadSampleOffset,
-                    sampleRate: audioClockSampleRate
-                )
+                if !isAudioSwitchInProgress() {
+                    masterClock.updateFromDecodeThread(
+                        node: audioPlayerNode,
+                        anchor: mediaTimelineAnchorValue(),
+                        offset: audioPlayheadSampleOffset,
+                        sampleRate: audioClockSampleRate
+                    )
+                }
             }
             checkBufferingGate()
         }
@@ -1384,6 +1461,10 @@ final class FFmpegPlaybackEngine {
         // Flush packet queues so decode threads stop processing stale packets.
         videoPacketQueue.flush()
         audioPacketQueue.flush()
+
+        // Block decode scheduling until the main-thread flush + anchor is applied.
+        setSeekAnchorPending(true)
+        setPostSeekTargetSeconds(seconds)
 
         // Clear queued frames immediately; recovery window is set AFTER the network seek completes
         // so it covers the actual decode burst, not the network I/O wait.
@@ -1426,6 +1507,7 @@ final class FFmpegPlaybackEngine {
             self.lastSeekAppliedOnMainHostTime = CACurrentMediaTime()
             self.seekMetricsLock.unlock()
             self.setSuppressDisplayLinkTicks(false)
+            self.setSeekAnchorPending(false)
         }
 
         videoDecoder.setSeekTarget(seconds)
@@ -1533,6 +1615,7 @@ final class FFmpegPlaybackEngine {
     /// Checks if post-seek buffering thresholds are met; if so, starts playback atomically.
     private func checkBufferingGate() {
         guard postSeekBuffering else { return }
+        if isSeekAnchorPending() { return }
 
         let videoReady: Bool
         if demuxer.videoStreamIndex >= 0 {
@@ -1555,6 +1638,7 @@ final class FFmpegPlaybackEngine {
 
         // Thresholds met — start playback atomically.
         postSeekBuffering = false
+        setPostSeekTargetSeconds(nil)
         PlaybackLog.seek(
             "[Seek] buffering complete: video_fifo=\(sampleRenderer.fifoCount) audio_sched=\(String(format: "%.2f", Double(lastAudioScheduleEndSample ?? 0) / (audioDecoder.outputFormat?.sampleRate ?? 44100)))s"
         )
@@ -1565,6 +1649,9 @@ final class FFmpegPlaybackEngine {
         }
         // Resume audio playback.
         audioPlayerNode?.play()
+        DispatchQueue.main.async { [weak self] in
+            self?.playerState.isBuffering = false
+        }
     }
 
     private static func avNoptsInt64() -> Int64 {
