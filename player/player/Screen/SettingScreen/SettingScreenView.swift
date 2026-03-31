@@ -51,6 +51,7 @@ struct SettingScreenView : View {
     
     @State private var subtitleHasBackground: Bool = true
     @State private var subtitleBoldEnabled: Bool = false
+    @State private var enableLibass: Bool = Settings.shared.enableLibass
     
     private let previewBaseText: String = "This is a preview subtitle"
     
@@ -147,6 +148,10 @@ struct SettingScreenView : View {
         .onAppear {
             ensureSingleSubtitleSettingsRow()
             syncLegacyPreviewStateFromModel()
+            enableLibass = Settings.shared.enableLibass
+        }
+        .onChange(of: enableLibass) { _, newValue in
+            Settings.shared.enableLibass = newValue
         }
         .onChange(of: subtitleHasBackground) { _, newValue in
             subtitleSettings.first?.backgroundColor = newValue ? "Black" : "Clear"
@@ -358,6 +363,14 @@ struct SettingScreenView : View {
                 .font(.system(size: 14, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.8))
             
+            VStack(spacing: 10) {
+                toggleRow(
+                    title: "Enable libass (Advanced subtitles)",
+                    description: "Use high-quality subtitle rendering with better styling support.",
+                    isOn: $enableLibass
+                )
+            }
+
             // Size
             settingRow(
                 title: "Size",

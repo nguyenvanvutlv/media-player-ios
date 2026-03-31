@@ -19,7 +19,11 @@ struct PlayerView: View {
     @State private var showPlaybackInfo = false
 
     init(url: URL, externalSubtitleURLs: [URL] = [], onClose: @escaping () -> Void = {}) {
-        let holder = ControllerHolder(url: url, externalSubtitleURLs: externalSubtitleURLs)
+        let holder = ControllerHolder(
+            url: url,
+            externalSubtitleURLs: externalSubtitleURLs,
+            enableLibass: Settings.shared.enableLibass
+        )
         _controllerHolder = StateObject(wrappedValue: holder)
         _state = ObservedObject(wrappedValue: holder.controller.state)
         self.onClose = onClose
@@ -56,10 +60,15 @@ struct PlayerView: View {
                     .allowsHitTesting(false)
                     .onAppear {
                         state.subtitleLayoutWidth = geo.size.width
+                        state.subtitleLayoutHeight = geo.size.height
                         controller.invalidateSubtitleOverlayLayout()
                     }
                     .onChange(of: geo.size.width) { _, w in
                         state.subtitleLayoutWidth = w
+                        controller.invalidateSubtitleOverlayLayout()
+                    }
+                    .onChange(of: geo.size.height) { _, h in
+                        state.subtitleLayoutHeight = h
                         controller.invalidateSubtitleOverlayLayout()
                     }
             }
@@ -234,7 +243,11 @@ struct PlayerView: View {
 private final class ControllerHolder: ObservableObject {
     @Published private(set) var controller: PlayerController
 
-    init(url: URL, externalSubtitleURLs: [URL]) {
-        controller = PlayerController(url: url, externalSubtitleURLs: externalSubtitleURLs)
+    init(url: URL, externalSubtitleURLs: [URL], enableLibass: Bool) {
+        controller = PlayerController(
+            url: url,
+            externalSubtitleURLs: externalSubtitleURLs,
+            enableLibass: enableLibass
+        )
     }
 }

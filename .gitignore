@@ -66,3 +66,4 @@ fastlane/test_output
 docs/
 output/
 .DS_Store
+build/

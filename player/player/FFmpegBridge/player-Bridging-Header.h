@@ -12,6 +12,10 @@
 #include <libavutil/hdr_dynamic_metadata.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#include "../../../libass/libass/ass.h"
 
 #import "FFmpegBridge.h"
 

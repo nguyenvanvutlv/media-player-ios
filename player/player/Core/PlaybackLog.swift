@@ -15,7 +15,11 @@ enum PlaybackLog {
 
     // Runtime-togglable log channels (DEBUG only). In Release, keep behavior minimal.
     private static let channelLock = NSLock()
-    private static var enabledChannels: Set<Channel> = Set(Channel.allCases)
+    private static var enabledChannels: Set<Channel> = [.subtitle]
+
+    /// When enabled, only logs that are explicitly related to libass will be emitted.
+    /// This is intended as a temporary noise-reduction switch during libass integration.
+    private static var libassOnlyLogging: Bool = true
 
     static func setChannelEnabled(_ channel: Channel, enabled: Bool) {
         channelLock.lock()
@@ -118,6 +122,14 @@ enum PlaybackLog {
 
     static func subtitleSelection(_ message: String) {
         guard isChannelEnabled(.subtitle) else { return }
+        if libassOnlyLogging {
+            // Keep only libass-related lines (mode, filter string, hash/fallback).
+            let keep =
+                message.contains("[libass]")
+                || message.contains("[subtitle] mode = libass")
+                || message.contains("[subtitle] mode = bitmap") == false && message.contains("mode = libass")
+            if !keep { return }
+        }
         subtitleLog.info("\(message, privacy: .public)")
 #if DEBUG
         NSLog("[player.subtitle] %@", message)

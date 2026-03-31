@@ -24,6 +24,7 @@ MIN_IOS="${MIN_IOS:-13.0}"
 MIN_TVOS="${MIN_TVOS:-13.0}"
 SKIP_SIM_X86="${SKIP_SIM_X86:-0}"
 : "${FFMPEG_EXTRA_CONFIGURE:=}"
+: "${DEPS_BUILD_ROOT:=${REPO_ROOT}/build}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -33,6 +34,7 @@ die() { echo "error: $*" >&2; exit 1; }
 command -v xcodebuild >/dev/null || die "xcodebuild not found (install Xcode)"
 command -v xcrun >/dev/null || die "xcrun not found"
 command -v libtool >/dev/null || die "libtool not found (expected /usr/bin/libtool on macOS)"
+command -v pkg-config >/dev/null || die "pkg-config not found (install via Homebrew: brew install pkg-config)"
 
 mkdir -p "${OUT_ROOT}" "${BUILD_ROOT}" "${LICENSE_DIR}"
 
@@ -84,6 +86,49 @@ merge_static_libs() {
 
 FAKE_PREFIX="/ffmpeg"
 
+build_deps() {
+  # Builds static freetype/fribidi/harfbuzz/libass for all FFmpeg slices.
+  # Output prefixes:
+  #   ${DEPS_BUILD_ROOT}/{slice}/prefix
+  BUILD_ROOT="${DEPS_BUILD_ROOT}" \
+  MIN_IOS="${MIN_IOS}" \
+  MIN_TVOS="${MIN_TVOS}" \
+  SKIP_SIM_X86="${SKIP_SIM_X86}" \
+  JOBS="${JOBS}" \
+    "${REPO_ROOT}/scripts/build-deps.sh"
+}
+
+# Best-effort guardrail: prevent pkg-config from resolving host .pc files.
+# We intentionally want ONLY per-slice, cross-compiled deps.
+pkg_config_env_for_prefix() {
+  local deps_prefix="$1"
+  echo "PKG_CONFIG_DIR=" \
+       "PKG_CONFIG_LIBDIR=${deps_prefix}/lib/pkgconfig" \
+       "PKG_CONFIG_PATH=${deps_prefix}/lib/pkgconfig"
+}
+
+assert_no_host_libs_in_pkg_config() {
+  local name="$1"
+  local deps_prefix="$2"
+  local sysroot="$3"
+
+  local pc_env libs cflags
+  pc_env="$(pkg_config_env_for_prefix "${deps_prefix}")"
+
+  # shellcheck disable=SC2086
+  libs="$(env ${pc_env} PKG_CONFIG_SYSROOT_DIR="${sysroot}" pkg-config --libs --static libass 2>/dev/null || true)"
+  # shellcheck disable=SC2086
+  cflags="$(env ${pc_env} PKG_CONFIG_SYSROOT_DIR="${sysroot}" pkg-config --cflags libass 2>/dev/null || true)"
+
+  # Reject obvious host paths. (SDK frameworks are fine; Homebrew/system dylib paths are not.)
+  if echo "${libs} ${cflags}" | grep -Eq '(/usr/local|/opt/homebrew|/usr/lib( |$))'; then
+    echo "error: ${name}: pkg-config for libass contains host paths:" >&2
+    echo "  cflags: ${cflags}" >&2
+    echo "  libs:   ${libs}" >&2
+    return 1
+  fi
+}
+
 # Returns path to merged libffmpeg.a on stdout; 0 on success, 1 on failure.
 run_configure_make_install() {
   local name="$1"
@@ -93,6 +138,10 @@ run_configure_make_install() {
   local min_ldflags="$5"
   local asm_flags="$6"
 
+  local deps_prefix="${DEPS_BUILD_ROOT}/${name}/prefix"
+  [[ -d "${deps_prefix}/include" ]] || die "missing deps prefix for ${name}: ${deps_prefix} (run scripts/build-deps.sh)"
+  [[ -f "${deps_prefix}/lib/pkgconfig/libass.pc" ]] || die "missing libass.pc for ${name}: ${deps_prefix}/lib/pkgconfig/libass.pc"
+
   local build_dir="${BUILD_ROOT}/${name}"
   local staging="${BUILD_ROOT}/${name}-install"
   rm -rf "${build_dir}" "${staging}"
@@ -101,6 +150,8 @@ run_configure_make_install() {
   local sysroot
   sysroot="$(xcrun --sdk "${sdk}" --show-sdk-path)"
   [[ -d "${sysroot}" ]] || { echo "Bad SDK path for ${sdk}: ${sysroot}" >&2; return 1; }
+
+  assert_no_host_libs_in_pkg_config "${name}" "${deps_prefix}" "${sysroot}"
 
   local cc cxx ar ranlib strip nm
   cc="xcrun -sdk ${sdk} clang"
@@ -117,6 +168,12 @@ run_configure_make_install() {
 
   local cflags="-arch ${clang_arch} -isysroot ${sysroot} ${min_cflags}"
   local ldflags="-arch ${clang_arch} -isysroot ${sysroot} ${min_ldflags}"
+
+  # External deps (libass + freetype/fribidi/harfbuzz) are built per-slice under ${DEPS_BUILD_ROOT}.
+  # Wire them into configure via pkg-config + explicit include/lib paths.
+  local deps_cflags="-I${deps_prefix}/include"
+  local deps_ldflags="-L${deps_prefix}/lib"
+  local pkg_config_path="${deps_prefix}/lib/pkgconfig"
 
   local enable_demuxers=()
   local enable_decoders=()
@@ -151,6 +208,11 @@ run_configure_make_install() {
 
   # shellcheck disable=SC2086
   if ! \
+  env \
+    PKG_CONFIG_DIR= \
+    PKG_CONFIG_LIBDIR="${pkg_config_path}" \
+    PKG_CONFIG_PATH="${pkg_config_path}" \
+    PKG_CONFIG_SYSROOT_DIR="${sysroot}" \
   "${FFMPEG_SRC}/configure" \
     --prefix="${FAKE_PREFIX}" \
     --cc="${cc}" \
@@ -180,20 +242,25 @@ run_configure_make_install() {
     --enable-swscale \
     --enable-swresample \
     --enable-avfilter \
+    --enable-libass \
+    --enable-filter=ass \
+    --enable-filter=subtitles \
     --disable-encoders \
     --disable-muxers \
     --enable-videotoolbox \
     --enable-audiotoolbox \
     --enable-hwaccel=h264_videotoolbox \
     --enable-hwaccel=hevc_videotoolbox \
+    --pkg-config-flags="--static" \
     "${enable_demuxers[@]}" \
     "${enable_decoders[@]}" \
     "${enable_parsers[@]}" \
     "${enable_protocols[@]}" \
     "${disable_decoders[@]}" \
     ${disable_parsers_flags} \
-    --extra-cflags="${cflags}" \
-    --extra-ldflags="${ldflags}" \
+    --extra-cflags="${cflags} ${deps_cflags}" \
+    --extra-ldflags="${ldflags} ${deps_ldflags}" \
+    --extra-libs="-lass -lharfbuzz -lfribidi -lfreetype" \
     ${FFMPEG_EXTRA_CONFIGURE} \
     2>&1 | tee -a "${BUILD_LOG}" >&2
   then
@@ -280,6 +347,8 @@ run_sim_build_with_asm_fallback() {
   rm -rf "${BUILD_ROOT}/${base_name}" "${BUILD_ROOT}/${base_name}-install"
   run_configure_make_install "${base_name}-noasm" "${sdk}" "${clang_arch}" "${min_c}" "${min_l}" "${fallback_asm}"
 }
+
+build_deps
 
 # --- iOS device (arm64) ---
 IOS_DEVICE_LIB="$(run_configure_make_install \

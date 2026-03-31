@@ -26,13 +26,19 @@ final class PlayerController {
     private var pendingSubtitleDebounceWork: DispatchWorkItem?
     private var lastSubtitleRenderedAt: CFTimeInterval?
     private let subtitleRenderQueue = DispatchQueue(label: "com.nvv.player.subtitle.render", qos: .userInitiated)
+    private var lastLibassHashLogSignature: String?
 
     var sampleRenderer: SampleBufferRenderer { engine.sampleRenderer }
 
-    init(url: URL, externalSubtitleURLs: [URL] = []) {
+    init(url: URL, externalSubtitleURLs: [URL] = [], enableLibass: Bool = false) {
         let state = PlayerState()
         self.state = state
-        let engine = FFmpegPlaybackEngine(playerState: state, mediaURL: url, externalSubtitleURLs: externalSubtitleURLs)
+        let engine = FFmpegPlaybackEngine(
+            playerState: state,
+            mediaURL: url,
+            externalSubtitleURLs: externalSubtitleURLs,
+            enableLibass: enableLibass
+        )
         self.engine = engine
         engine.onPlaybackTick = { [weak self] mediaSeconds in
             self?.updateSubtitle(currentTime: mediaSeconds)
@@ -244,7 +250,7 @@ final class PlayerController {
         let scale = max(1.0, state.subtitleDisplayScale)
         let widthBucket = Int((w / 8.0).rounded(.down)) * 8
         let scaleBucket = Int((scale * 10.0).rounded()) // 0.1 steps
-        let styleSig = "\(subtitleStyle.fontSize)|\(subtitleStyle.textColor.description)|\(String(describing: subtitleStyle.backgroundColor))"
+        let styleSig = "\(subtitleStyle.fontSize)|\(subtitleStyle.textColor.description)|\(String(describing: subtitleStyle.backgroundColor))|\(subtitleStyle.isBoldEnabled ? 1 : 0)|off=\(String(format: "%.1f", state.subtitleOverlayVerticalOffset))|h=\(Int(state.subtitleLayoutHeight))"
         let sig = "\(frame.plainText)|\(frame.ptsMs)|\(frame.assRaw ?? "")|w\(widthBucket)|s\(scaleBucket)|\(styleSig)"
         guard sig != lastSubtitleOverlaySignature else { return }
         lastSubtitleOverlaySignature = sig
@@ -267,21 +273,43 @@ final class PlayerController {
         let renderAss = frame.assRaw
         let renderPtsMs = frame.ptsMs
         let renderMaxWidth = w
+        let renderCanvasHeight = max(60, state.subtitleLayoutHeight)
         let renderScale = scale
         let renderStyle = subtitleStyle
+        let renderVerticalOffset = CGFloat(state.subtitleOverlayVerticalOffset)
         subtitleRenderQueue.async { [weak self] in
             guard let self else { return }
-            let img = SubtitleBitmapRenderer.render(
-                plainText: renderText,
-                assRaw: renderAss,
-                maxWidth: renderMaxWidth,
-                displayScale: renderScale,
-                style: renderStyle
-            )
+            let img: UIImage? = {
+                if Settings.shared.enableLibass {
+                    let cfg = LibassStyleConfig(
+                        fontSize: renderStyle.fontSize,
+                        isBold: renderStyle.isBoldEnabled,
+                        textColor: renderStyle.textColor,
+                        backgroundColor: renderStyle.backgroundColor,
+                        verticalOffset: renderVerticalOffset
+                    )
+                    return LibassSubtitleOneshotRenderer.shared.render(
+                        plainText: renderText,
+                        assRaw: renderAss,
+                        canvasWidth: renderMaxWidth,
+                        canvasHeight: renderCanvasHeight,
+                        displayScale: renderScale,
+                        styleConfig: cfg
+                    )
+                }
+                return SubtitleBitmapRenderer.render(
+                    plainText: renderText,
+                    assRaw: renderAss,
+                    maxWidth: renderMaxWidth,
+                    displayScale: renderScale,
+                    style: renderStyle
+                )
+            }()
             Task { @MainActor in
                 // Drop stale work if a newer subtitle/frame/style was selected.
                 guard self.lastSubtitleOverlaySignature == renderSig else { return }
                 self.state.subtitleOverlayImage = img
+                self.state.subtitleOverlayIsFullFrame = Settings.shared.enableLibass
                 if let img {
                     let sz = img.size
                     PlaybackLog.subtitleOverlayRender(
@@ -289,7 +317,7 @@ final class PlayerController {
                         width: Int(sz.width * renderScale),
                         height: Int(sz.height * renderScale),
                         hasImage: true,
-                        backend: "CoreGraphics"
+                        backend: Settings.shared.enableLibass ? "libass" : "CoreGraphics"
                     )
                     PlaybackLog.subtitleOverlayLayer(
                         sizeWidth: Int(sz.width * renderScale),
@@ -301,7 +329,7 @@ final class PlayerController {
                         width: 0,
                         height: 0,
                         hasImage: false,
-                        backend: "CoreGraphics"
+                        backend: Settings.shared.enableLibass ? "libass" : "CoreGraphics"
                     )
                 }
             }

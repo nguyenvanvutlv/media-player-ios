@@ -34,11 +34,17 @@ final class PlayerState: ObservableObject {
     @Published var subtitleOverlayVerticalOffset: Double = 0
     /// Width from layout for text wrapping (defaults until first `GeometryReader` update).
     @Published var subtitleLayoutWidth: CGFloat = 400
+    /// Height from layout; used by libass to match the overlay canvas.
+    @Published var subtitleLayoutHeight: CGFloat = 225
     /// Device / scene pixel scale from SwiftUI `Environment` (avoid deprecated `UIScreen.main`).
     @Published var subtitleDisplayScale: CGFloat = 3.0
 
     /// One-shot user-visible error from playback.
     @Published var alertMessage: String?
+
+    /// When true, subtitles are already burned into video frames via FFmpeg/libass.
+    /// UI bitmap overlay must be suppressed to avoid mixing render backends.
+    @Published var isLibassBurnInActive: Bool = false
 
     /// Updated by `PictureInPictureCoordinator` (PiP may stay false on Simulator or before playback is ready).
     @Published var isPictureInPicturePossible: Bool = false
@@ -61,7 +67,9 @@ final class PlayerState: ObservableObject {
         subtitleOverlayIsFullFrame = false
         subtitleOverlayVerticalOffset = 0
         subtitleLayoutWidth = 400
+        subtitleLayoutHeight = 225
         alertMessage = nil
+        isLibassBurnInActive = false
         isPictureInPicturePossible = false
     }
 }

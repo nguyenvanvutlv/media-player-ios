@@ -1,9 +1,9 @@
 import AVFoundation
-import CoreVideo
 import CoreMedia
+import CoreVideo
 import Foundation
 
-private let ffThreadFrame: Int32 = 1 // FF_THREAD_FRAME
+private let ffThreadFrame: Int32 = 1  // FF_THREAD_FRAME
 
 enum CoreVideoDecoderError: Error {
     case noCodec
@@ -91,22 +91,26 @@ final class CoreVideoDecoder {
         }
     }
 
-    func open(codecpar: UnsafePointer<AVCodecParameters>) throws {
+    func open(codecpar: UnsafePointer<AVCodecParameters>, forceSoftwareDecode: Bool = false) throws {
         close()
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw CoreVideoDecoderError.noCodec
         }
-#if os(iOS) || os(tvOS)
-        do {
-            try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: true)
-            return
-        } catch {
-            PlaybackLog.video(
-                "[Video][WARN] VideoToolbox hwaccel unavailable or open failed — software fallback (\(String(describing: error)))"
-            )
-            close()
+        #if os(iOS) || os(tvOS)
+        if !forceSoftwareDecode {
+            do {
+                try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: true)
+                return
+            } catch {
+                PlaybackLog.video(
+                    "[Video][WARN] VideoToolbox hwaccel unavailable or open failed — software fallback (\(String(describing: error)))"
+                )
+                close()
+            }
+        } else {
+            PlaybackLog.video("[Video] libass enabled → forcing software decode (VideoToolbox disabled)")
         }
-#endif
+        #endif
         try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: false)
     }
 
@@ -117,26 +121,31 @@ final class CoreVideoDecoder {
         useVideoToolboxHw: Bool
     ) throws {
         var ctxPtr: UnsafeMutablePointer<AVCodecContext>? = avcodec_alloc_context3(codec)
-        guard let ctx = ctxPtr else { throw CoreVideoDecoderError.openFailed(code: ff_err_enomem()) }
+        guard let ctx = ctxPtr else {
+            throw CoreVideoDecoderError.openFailed(code: ff_err_enomem())
+        }
         var err = avcodec_parameters_to_context(ctx, codecpar)
-        if err < 0 { avcodec_free_context(&ctxPtr); throw CoreVideoDecoderError.openFailed(code: err) }
+        if err < 0 {
+            avcodec_free_context(&ctxPtr)
+            throw CoreVideoDecoderError.openFailed(code: err)
+        }
 
         let codecName = String(cString: codec.pointee.name)
         var usesVtHw = false
-#if os(iOS) || os(tvOS)
-        if useVideoToolboxHw {
-            let st = ff_videotoolbox_setup_decoder(ctx, codec)
-            if st == 0 {
-                usesVtHw = true
-                ctx.pointee.thread_count = 0
-                ctx.pointee.thread_type = 0
-                ctx.pointee.extra_hw_frames = 16
-            } else {
-                avcodec_free_context(&ctxPtr)
-                throw CoreVideoDecoderError.openFailed(code: st)
+        #if os(iOS) || os(tvOS)
+            if useVideoToolboxHw {
+                let st = ff_videotoolbox_setup_decoder(ctx, codec)
+                if st == 0 {
+                    usesVtHw = true
+                    ctx.pointee.thread_count = 0
+                    ctx.pointee.thread_type = 0
+                    ctx.pointee.extra_hw_frames = 16
+                } else {
+                    avcodec_free_context(&ctxPtr)
+                    throw CoreVideoDecoderError.openFailed(code: st)
+                }
             }
-        }
-#endif
+        #endif
         if !usesVtHw {
             let n = ProcessInfo.processInfo.processorCount
             ctx.pointee.thread_count = Int32(min(8, max(2, n)))
@@ -147,7 +156,10 @@ final class CoreVideoDecoder {
         }
 
         err = avcodec_open2(ctx, codec, nil)
-        if err < 0 { avcodec_free_context(&ctxPtr); throw CoreVideoDecoderError.openFailed(code: err) }
+        if err < 0 {
+            avcodec_free_context(&ctxPtr)
+            throw CoreVideoDecoderError.openFailed(code: err)
+        }
         codecContext = ctx
         let w = Int(ctx.pointee.width)
         let h = Int(ctx.pointee.height)
@@ -160,18 +172,23 @@ final class CoreVideoDecoder {
         )
         PlaybackLog.video(usesVtHw ? "[Video] decoder: hardware" : "[Video] decoder: software")
         if usesVtHw {
-            PlaybackLog.video("[Video] using hardware decode (VideoToolbox hwaccel + \(codecName) decoder)")
+            PlaybackLog.video(
+                "[Video] using hardware decode (VideoToolbox hwaccel + \(codecName) decoder)")
         }
         if !usesVtHw,
-           (codecpar.pointee.codec_id == AV_CODEC_ID_HEVC || codecpar.pointee.codec_id == AV_CODEC_ID_H264),
-           (w >= 3840 || h >= 2160)
+            codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+                || codecpar.pointee.codec_id == AV_CODEC_ID_H264,
+            w >= 3840 || h >= 2160
         {
             PlaybackLog.video(
                 "[Video][WARN] 4K software decode detected at \(w)x\(h) — expected VideoToolbox; playback may stutter"
             )
         }
         frame = av_frame_alloc()
-        if frame == nil { avcodec_free_context(&ctxPtr); throw CoreVideoDecoderError.allocateFrameFailed }
+        if frame == nil {
+            avcodec_free_context(&ctxPtr)
+            throw CoreVideoDecoderError.allocateFrameFailed
+        }
 
         let fr = ctx.pointee.framerate
         if fr.num > 0, fr.den > 0 {
@@ -273,7 +290,8 @@ final class CoreVideoDecoder {
                 }
                 // Reached (or passed) the target → stop skipping, restore normal decode.
                 if seekSkippedFrameCount > 0 {
-                    PlaybackLog.seek("[Seek] skipped \(seekSkippedFrameCount) pre-target frames during catch-up")
+                    PlaybackLog.seek(
+                        "[Seek] skipped \(seekSkippedFrameCount) pre-target frames during catch-up")
                 }
                 clearSeekTarget()
             }
@@ -284,6 +302,7 @@ final class CoreVideoDecoder {
                 logFirstFrameSummaryIfNeeded(frame: frm, path: "videotoolbox")
                 return sb
             }
+
             let sb = try makeSampleBufferViaSwscale(frame: frm, timeBase: timeBase)
             if sb != nil {
                 logFirstFrameSummaryIfNeeded(frame: frm, path: "swscale")
@@ -299,48 +318,62 @@ final class CoreVideoDecoder {
         let h = Int(frame.pointee.height)
         let fmt = Int32(frame.pointee.format)
         PlaybackLog.video("[Video] first frame path=\(path) pix_fmt=\(fmt) size=\(w)x\(h)")
-        if !isUsingVideoToolbox, !logged4kSoftwareWarning, (w >= 3840 || h >= 2160) {
+        if !isUsingVideoToolbox, !logged4kSoftwareWarning, w >= 3840 || h >= 2160 {
             logged4kSoftwareWarning = true
             PlaybackLog.video("[Video][WARN] SW decode detected for 4K (pix_fmt=\(fmt))")
         }
     }
 
-    private func makeSampleBufferFromVideoToolbox(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) throws -> CMSampleBuffer {
+    private func makeSampleBufferFromVideoToolbox(
+        frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational
+    ) throws -> CMSampleBuffer {
         guard let raw = frame.pointee.data.3 else {
             throw CoreVideoDecoderError.openFailed(code: -3)
         }
-        let cvBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw)).takeUnretainedValue()
+        let cvBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(UnsafeRawPointer(raw))
+            .takeUnretainedValue()
         attachHDRMetadata(to: cvBuffer, frame: frame)
         return try wrapPixelBuffer(cvBuffer, frame: frame, timeBase: timeBase)
     }
 
-    private func makeSampleBufferViaSwscale(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) throws -> CMSampleBuffer? {
+    private func makeSampleBufferViaSwscale(
+        frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational
+    ) throws -> CMSampleBuffer? {
         let streamLooksHDR = isHDRish(frame: frame)
         #if targetEnvironment(simulator)
-        return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: false)
+            return try makeSampleBufferViaSwscale(
+                frame: frame, timeBase: timeBase, hdrOutput: false)
         #else
-        if streamLooksHDR {
-            do {
-                return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: true)
-            } catch CoreVideoDecoderError.pixelBufferFailed {
-                return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: false)
+            if streamLooksHDR {
+                do {
+                    return try makeSampleBufferViaSwscale(
+                        frame: frame, timeBase: timeBase, hdrOutput: true)
+                } catch CoreVideoDecoderError.pixelBufferFailed {
+                    return try makeSampleBufferViaSwscale(
+                        frame: frame, timeBase: timeBase, hdrOutput: false)
+                }
             }
-        }
-        return try makeSampleBufferViaSwscale(frame: frame, timeBase: timeBase, hdrOutput: false)
+            return try makeSampleBufferViaSwscale(
+                frame: frame, timeBase: timeBase, hdrOutput: false)
         #endif
     }
 
-    private func makeSampleBufferViaSwscale(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational, hdrOutput: Bool) throws -> CMSampleBuffer? {
+    private func makeSampleBufferViaSwscale(
+        frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational, hdrOutput: Bool
+    ) throws -> CMSampleBuffer? {
         let w = frame.pointee.width
         let h = frame.pointee.height
         let srcFmt = AVPixelFormat(frame.pointee.format)
 
         let dst: AVPixelFormat = hdrOutput ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12
-        let cvFormat: OSType = hdrOutput
+        let cvFormat: OSType =
+            hdrOutput
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
-        if sws == nil || w != lastWidth || h != lastHeight || srcFmt != lastSrcFmt || dst != dstPixFmt {
+        if sws == nil || w != lastWidth || h != lastHeight || srcFmt != lastSrcFmt
+            || dst != dstPixFmt
+        {
             if let s = sws {
                 ff_sws_free(s)
                 sws = nil
@@ -371,7 +404,9 @@ final class CoreVideoDecoder {
         return try wrapPixelBuffer(pb, frame: frame, timeBase: timeBase)
     }
 
-    private func obtainPixelBufferFromPool(width: Int32, height: Int32, format: OSType) throws -> CVPixelBuffer {
+    private func obtainPixelBufferFromPool(width: Int32, height: Int32, format: OSType) throws
+        -> CVPixelBuffer
+    {
         if pixelBufferPool == nil
             || pixelBufferPoolKey?.w != width
             || pixelBufferPoolKey?.h != height
@@ -385,7 +420,8 @@ final class CoreVideoDecoder {
                 kCVPixelBufferMetalCompatibilityKey: true,
             ]
             var pool: CVPixelBufferPool?
-            let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, pbAttrs as CFDictionary, &pool)
+            let status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault, nil, pbAttrs as CFDictionary, &pool)
             guard status == kCVReturnSuccess, let created = pool else {
                 throw CoreVideoDecoderError.pixelBufferFailed
             }
@@ -412,7 +448,7 @@ final class CoreVideoDecoder {
         defer { CVPixelBufferUnlockBaseAddress(dstPixelBuffer, []) }
 
         guard let yBase = CVPixelBufferGetBaseAddressOfPlane(dstPixelBuffer, 0),
-              let uvBase = CVPixelBufferGetBaseAddressOfPlane(dstPixelBuffer, 1)
+            let uvBase = CVPixelBufferGetBaseAddressOfPlane(dstPixelBuffer, 1)
         else {
             throw CoreVideoDecoderError.pixelBufferFailed
         }
@@ -460,11 +496,17 @@ final class CoreVideoDecoder {
         if trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67 { return true }
         if frame.pointee.color_primaries == AVCOL_PRI_BT2020 { return true }
         let f = frame.pointee.format
-        if f == AV_PIX_FMT_YUV420P10LE.rawValue || f == AV_PIX_FMT_YUV420P12LE.rawValue || f == AV_PIX_FMT_P010LE.rawValue { return true }
+        if f == AV_PIX_FMT_YUV420P10LE.rawValue || f == AV_PIX_FMT_YUV420P12LE.rawValue
+            || f == AV_PIX_FMT_P010LE.rawValue
+        {
+            return true
+        }
         return false
     }
 
-    private func createCVPixelBuffer(from frame: UnsafeMutablePointer<AVFrame>, format: OSType, is10Bit: Bool) throws -> CVPixelBuffer {
+    private func createCVPixelBuffer(
+        from frame: UnsafeMutablePointer<AVFrame>, format: OSType, is10Bit: Bool
+    ) throws -> CVPixelBuffer {
         let w = max(1, Int(frame.pointee.width))
         let h = max(1, Int(frame.pointee.height))
 
@@ -473,7 +515,7 @@ final class CoreVideoDecoder {
             kCVPixelBufferMetalCompatibilityKey: true,
         ]
         let attrsBasic: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]
         ]
 
         var pb: CVPixelBuffer?
@@ -506,7 +548,9 @@ final class CoreVideoDecoder {
         return pixelBuffer
     }
 
-    private func copyNV12Like(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer, is10Bit: Bool) {
+    private func copyNV12Like(
+        from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer, is10Bit: Bool
+    ) {
         let w = Int(frame.pointee.width)
         let h = Int(frame.pointee.height)
         guard let yDest = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return }
@@ -547,7 +591,9 @@ final class CoreVideoDecoder {
         if let transfer = mapTransfer(frame.pointee.color_trc) {
             CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
         }
-        if let matrix = mapMatrix(frame.pointee.colorspace, primaries: frame.pointee.color_primaries) {
+        if let matrix = mapMatrix(
+            frame.pointee.colorspace, primaries: frame.pointee.color_primaries)
+        {
             CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
         }
 
@@ -583,7 +629,8 @@ final class CoreVideoDecoder {
     }
 
     private func mapMatrix(_ sp: AVColorSpace, primaries: AVColorPrimaries) -> CFString? {
-        if primaries == AVCOL_PRI_BT2020 || sp == AVCOL_SPC_BT2020_NCL || sp == AVCOL_SPC_BT2020_CL {
+        if primaries == AVCOL_PRI_BT2020 || sp == AVCOL_SPC_BT2020_NCL || sp == AVCOL_SPC_BT2020_CL
+        {
             return kCVImageBufferYCbCrMatrix_ITU_R_2020
         }
         return kCVImageBufferYCbCrMatrix_ITU_R_709_2
@@ -591,7 +638,8 @@ final class CoreVideoDecoder {
 
     private func applyMastering(_ pb: CVPixelBuffer, data: UnsafePointer<UInt8>, size: Int) {
         guard size >= MemoryLayout<AVMasteringDisplayMetadata>.size else { return }
-        let m = UnsafeRawPointer(data).assumingMemoryBound(to: AVMasteringDisplayMetadata.self).pointee
+        let m = UnsafeRawPointer(data).assumingMemoryBound(to: AVMasteringDisplayMetadata.self)
+            .pointee
         guard m.has_primaries != 0, m.has_luminance != 0 else { return }
 
         let dp = m.display_primaries
@@ -606,7 +654,9 @@ final class CoreVideoDecoder {
             "MinLuminance": av_q2d(m.min_luminance),
             "MaxLuminance": av_q2d(m.max_luminance),
         ]
-        CVBufferSetAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey, dict as CFDictionary, .shouldPropagate)
+        CVBufferSetAttachment(
+            pb, kCVImageBufferMasteringDisplayColorVolumeKey, dict as CFDictionary, .shouldPropagate
+        )
     }
 
     private func applyContentLight(_ pb: CVPixelBuffer, data: UnsafePointer<UInt8>, size: Int) {
@@ -616,11 +666,14 @@ final class CoreVideoDecoder {
             "MaxContentLightLevel": Double(c.MaxCLL),
             "MaxPicAverageLightLevel": Double(c.MaxFALL),
         ]
-        CVBufferSetAttachment(pb, kCVImageBufferContentLightLevelInfoKey, dict as CFDictionary, .shouldPropagate)
+        CVBufferSetAttachment(
+            pb, kCVImageBufferContentLightLevelInfoKey, dict as CFDictionary, .shouldPropagate)
     }
 
     /// Media timeline aligned to 0 s; `AVSampleBufferDisplayLayer` shows frames when `controlTimebase` catches up to these PTS values.
-    private func presentationTimes(for frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) -> (CMTime, CMTime) {
+    private func presentationTimes(for frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational)
+        -> (CMTime, CMTime)
+    {
         let tb = timeBase
         let pts = frame.pointee.best_effort_timestamp
         let duration = frame.pointee.duration
@@ -642,7 +695,8 @@ final class CoreVideoDecoder {
             syncedFirstFrameMediaSeconds = ptsSeconds
             timelineOriginLock.unlock()
         }
-        var relSeconds = max(0, ptsSeconds - (timelineOriginSeconds ?? 0)) + presentationShiftSeconds
+        var relSeconds =
+            max(0, ptsSeconds - (timelineOriginSeconds ?? 0)) + presentationShiftSeconds
 
         if let last = lastPresentationSeconds, relSeconds <= last {
             relSeconds = last + minPresentationStep
@@ -663,17 +717,22 @@ final class CoreVideoDecoder {
         )
     }
 
-    private func wrapPixelBuffer(_ pb: CVPixelBuffer, frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) throws -> CMSampleBuffer {
+    private func wrapPixelBuffer(
+        _ pb: CVPixelBuffer, frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational
+    ) throws -> CMSampleBuffer {
         let cw = CVPixelBufferGetWidth(pb)
         let ch = CVPixelBufferGetHeight(pb)
         let cpf = CVPixelBufferGetPixelFormatType(pb)
 
         let formatDescription: CMVideoFormatDescription
-        if let key = cachedVideoFormatKey, key.w == cw, key.h == ch, key.pf == cpf, let cached = cachedVideoFormatDesc {
+        if let key = cachedVideoFormatKey, key.w == cw, key.h == ch, key.pf == cpf,
+            let cached = cachedVideoFormatDesc
+        {
             formatDescription = cached
         } else {
             var fmt: CMVideoFormatDescription?
-            let cStatus = CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fmt)
+            let cStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fmt)
             if cStatus != noErr { throw CoreVideoDecoderError.formatDescriptionFailed }
             guard let fd = fmt else { throw CoreVideoDecoderError.formatDescriptionFailed }
             cachedVideoFormatDesc = fd

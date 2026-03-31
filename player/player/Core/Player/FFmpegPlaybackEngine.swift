@@ -15,9 +15,11 @@ final class FFmpegPlaybackEngine {
     /// Demux thread: reads packets from FFmpeg and dispatches to packet queues.
     private let demuxQueue = DispatchQueue(label: "com.nvv.player.demux", qos: .userInteractive)
     /// Video decode thread: pulls from videoPacketQueue, decodes, syncs, pushes to renderer.
-    private let videoDecodeQueue = DispatchQueue(label: "com.nvv.player.decode.video", qos: .userInteractive)
+    private let videoDecodeQueue = DispatchQueue(
+        label: "com.nvv.player.decode.video", qos: .userInteractive)
     /// Audio decode thread: pulls from audioPacketQueue, decodes, schedules PCM.
-    private let audioDecodeQueue = DispatchQueue(label: "com.nvv.player.decode.audio", qos: .userInteractive)
+    private let audioDecodeQueue = DispatchQueue(
+        label: "com.nvv.player.decode.audio", qos: .userInteractive)
 
     /// Bounded packet queues between demux → decode threads.
     private let videoPacketQueue = PacketQueue(capacity: 64)
@@ -312,7 +314,7 @@ final class FFmpegPlaybackEngine {
     private var hasActiveAudioStreamForClock: Bool = false
     private var audioClockSampleRate: Double = 44100
     #if DEBUG
-    private var lastAVDriftLogHostTime: CFTimeInterval = 0
+        private var lastAVDriftLogHostTime: CFTimeInterval = 0
     #endif
     private var lastAudioScheduledEndSeconds: Double = 0
     private var lastBacklogLogHostTime: CFTimeInterval = 0
@@ -326,11 +328,18 @@ final class FFmpegPlaybackEngine {
 
     var mediaURL: URL?
     var externalSubtitleURLs: [URL] = []
+    private let enableLibass: Bool
 
-    init(playerState: PlayerState, mediaURL: URL?, externalSubtitleURLs: [URL] = []) {
+    init(
+        playerState: PlayerState,
+        mediaURL: URL?,
+        externalSubtitleURLs: [URL] = [],
+        enableLibass: Bool = false
+    ) {
         self.playerState = playerState
         self.mediaURL = mediaURL
         self.externalSubtitleURLs = externalSubtitleURLs
+        self.enableLibass = enableLibass
         displayLinkDriver.onFire = { [weak self] in
             self?.onDisplayLink()
         }
@@ -638,22 +647,22 @@ final class FFmpegPlaybackEngine {
         )
 
         #if DEBUG
-        if useAudioClock {
-            let videoT = anchor + sampleRenderer.presentationClockSeconds()
-            let driftMs = abs(videoT - clamped) * 1000
-            if driftMs > 100 {
-                let now = CACurrentMediaTime()
-                if now - lastAVDriftLogHostTime > 1.0 {
-                    lastAVDriftLogHostTime = now
-                    PlaybackLog.sync(
-                        String(
-                            format: "[Sync][drift] video_pts≈%.3fs audio_master=%.3fs Δ=%.1fms",
-                            videoT, clamped, driftMs
+            if useAudioClock {
+                let videoT = anchor + sampleRenderer.presentationClockSeconds()
+                let driftMs = abs(videoT - clamped) * 1000
+                if driftMs > 100 {
+                    let now = CACurrentMediaTime()
+                    if now - lastAVDriftLogHostTime > 1.0 {
+                        lastAVDriftLogHostTime = now
+                        PlaybackLog.sync(
+                            String(
+                                format: "[Sync][drift] video_pts≈%.3fs audio_master=%.3fs Δ=%.1fms",
+                                videoT, clamped, driftMs
+                            )
                         )
-                    )
+                    }
                 }
             }
-        }
         #endif
 
         MainActor.assumeIsolated {
@@ -767,7 +776,7 @@ final class FFmpegPlaybackEngine {
         audioScheduleShiftSeconds = 0
 
         if demuxer.videoStreamIndex >= 0, let vp = demuxer.videoCodecParameters() {
-            try videoDecoder.open(codecpar: vp)
+            try videoDecoder.open(codecpar: vp, forceSoftwareDecode: enableLibass)
             videoDecoder.setPresentationShiftSeconds(0)
             // Phase 8 perf guard: if HW decode isn't available, reject overly heavy streams early.
             #if os(iOS) || os(tvOS)
@@ -924,10 +933,13 @@ final class FFmpegPlaybackEngine {
         subtitleStreamIndex = -1
         loggedBitmapSubtitleNoText = false
         subtitleDecodeErrorCount = 0
+        PlaybackLog.subtitleSelection(
+            "[libass] setting=\(enableLibass ? "ON" : "OFF") selected=\(index)")
         guard index > 0 else { return }
         let embeddedCount = demuxer.subtitleStreamIndices.count
         if index <= embeddedCount {
             let si = demuxer.subtitleStreamIndices[index - 1]
+            PlaybackLog.subtitleSelection("[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
             guard let par = demuxer.codecParameters(streamIndex: si) else {
                 PlaybackLog.subtitleSelection(
                     "subtitle decoder open FAILED: no codec parameters streamIndex=\(si)")
@@ -953,8 +965,69 @@ final class FFmpegPlaybackEngine {
                 )
             }
         } else {
+            PlaybackLog.subtitleSelection("[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
             PlaybackLog.subtitleSelection(
                 "subtitle external track — using preloaded cues (no embedded decoder)")
+        }
+    }
+
+    /// Converts a subtitle URL into a local filesystem path suitable for FFmpeg's `subtitles=` filter.
+    /// Returns nil if the URL can't be resolved safely (fallback to bitmap pipeline).
+    private func resolveLocalSubtitlePathForLibass(url: URL) -> String? {
+        // Basic safety guard: avoid huge subtitle files on-device (perf + memory risk).
+        let maxBytes = 8 * 1024 * 1024
+
+        if url.isFileURL {
+            let path = url.path
+            if let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size])
+                as? NSNumber
+            {
+                if size.intValue > maxBytes {
+                    PlaybackLog.subtitleSelection(
+                        "[libass] subtitle file too large (\(size.intValue) bytes) → fallback")
+                    return nil
+                }
+            }
+            return path
+        }
+
+        // Remote URL: download a cached temp file once for this session.
+        // Keep it synchronous on the demux thread (never on main) for deterministic setup.
+        var data: Data?
+        let sem = DispatchSemaphore(value: 0)
+        var taskErr: Error?
+        let task = URLSession.shared.dataTask(with: url) { d, _, err in
+            data = d
+            taskErr = err
+            sem.signal()
+        }
+        task.resume()
+        _ = sem.wait(timeout: .now() + 6.0)
+        if let err = taskErr {
+            PlaybackLog.subtitleSelection(
+                "[libass] remote subtitle download failed: \(err.localizedDescription)")
+            return nil
+        }
+        guard let d = data, !d.isEmpty else {
+            PlaybackLog.subtitleSelection(
+                "[libass] remote subtitle download empty/timeout → fallback")
+            return nil
+        }
+        if d.count > maxBytes {
+            PlaybackLog.subtitleSelection(
+                "[libass] remote subtitle too large (\(d.count) bytes) → fallback")
+            return nil
+        }
+        let ext = url.pathExtension.isEmpty ? "srt" : url.pathExtension
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("libass-\(UUID().uuidString).\(ext)")
+        do {
+            try d.write(to: file, options: [.atomic])
+            return file.path
+        } catch {
+            PlaybackLog.subtitleSelection(
+                "[libass] failed to write temp subtitle: \(error.localizedDescription)")
+            return nil
         }
     }
 
@@ -1107,7 +1180,7 @@ final class FFmpegPlaybackEngine {
             return
         }
         let audioT = masterClock.mediaSecondsForVideoSync()
-        
+
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let rel = CMTimeGetSeconds(pts)
         guard rel.isFinite else {
@@ -1115,22 +1188,23 @@ final class FFmpegPlaybackEngine {
             return
         }
         let videoT = anchor + max(0, rel)
-        
+
         // Log sync drift before decision
         let diffMs = (videoT - audioT) * 1000
         #if DEBUG
-        if Int.random(in: 0..<50) == 0 {
-            PlaybackLog.syncDrift(audioClockSec: audioT, videoPtsSec: videoT, diffMs: diffMs)
-        }
-        if abs(diffMs) > 100 {
-            if Int.random(in: 0..<30) == 0 {
-                PlaybackLog.driftAlert(diffMs: diffMs)
+            if Int.random(in: 0..<50) == 0 {
+                PlaybackLog.syncDrift(audioClockSec: audioT, videoPtsSec: videoT, diffMs: diffMs)
             }
-        }
+            if abs(diffMs) > 100 {
+                if Int.random(in: 0..<30) == 0 {
+                    PlaybackLog.driftAlert(diffMs: diffMs)
+                }
+            }
         #endif
 
-        let decision = syncController.decide(videoPtsMediaSeconds: videoT, audioClockMediaSeconds: audioT)
-        
+        let decision = syncController.decide(
+            videoPtsMediaSeconds: videoT, audioClockMediaSeconds: audioT)
+
         switch decision {
         case .enqueue:
             sampleRenderer.pushDecodedFrame(sample)
@@ -1201,13 +1275,15 @@ final class FFmpegPlaybackEngine {
                     do {
                         do {
                             let engineFmt = preferredAudioFormat(for: ap)
-                            try audioDecoder.open(codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
+                            try audioDecoder.open(
+                                codecpar: ap, engineFormat: engineFmt, timeBase: aTb)
                         } catch {
                             PlaybackLog.audio(
                                 "[Audio][WARN] SAFE switch multichannel open failed; fallback to bus format (\(error.localizedDescription))"
                             )
                             let fallbackFmt = probePlayerNodeInputFormat()
-                            try audioDecoder.open(codecpar: ap, engineFormat: fallbackFmt, timeBase: aTb)
+                            try audioDecoder.open(
+                                codecpar: ap, engineFormat: fallbackFmt, timeBase: aTb)
                         }
                         decoderAudioStreamIndex = demuxer.audioStreamIndex
                         if let fmt = audioDecoder.outputFormat {
@@ -1217,7 +1293,8 @@ final class FFmpegPlaybackEngine {
                         if let fmt = audioDecoder.outputFormat {
                             audioClockSampleRate = fmt.sampleRate
                         }
-                        PlaybackLog.audio("[Audio] SAFE switch complete (decoder reopened + engine restarted)")
+                        PlaybackLog.audio(
+                            "[Audio] SAFE switch complete (decoder reopened + engine restarted)")
                     } catch {
                         PlaybackLog.audio(
                             "[Audio][ERROR] SAFE switch reopen failed: \(error.localizedDescription)"
@@ -1369,7 +1446,8 @@ final class FFmpegPlaybackEngine {
                 do {
                     sb = try videoDecoder.receiveSampleBuffer(timeBase: vTimeBase)
                 } catch {
-                    PlaybackLog.video("[Video][ERROR] receiveSampleBuffer: \(error.localizedDescription)")
+                    PlaybackLog.video(
+                        "[Video][ERROR] receiveSampleBuffer: \(error.localizedDescription)")
                     break
                 }
                 guard let sample = sb else { break }
@@ -1536,7 +1614,9 @@ final class FFmpegPlaybackEngine {
         subtitleDecodeErrorCount = 0
         audioSessionAnchorPtsSec = nil
         lastAudioScheduleEndSample = nil
-        PlaybackLog.audio("[Audio] schedule state cleared (anchor + queued sample cursor); node stopped, playhead offset=0")
+        PlaybackLog.audio(
+            "[Audio] schedule state cleared (anchor + queued sample cursor); node stopped, playhead offset=0"
+        )
 
         // Audio seek: avoid restarting audio engine on every seek (can cause visible stutter on some devices).
         // Only reopen decoder / reinstall engine when the active audio stream changed (e.g. user switched audio track).
