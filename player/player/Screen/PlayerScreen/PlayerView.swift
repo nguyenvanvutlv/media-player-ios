@@ -96,6 +96,7 @@ struct PlayerView: View {
         .background(Color.black)
         .preferredColorScheme(.dark)
         .onAppear {
+            OrientationManager.shared.lockToLandscape()
             state.subtitleDisplayScale = displayScale
             controller.startPlayback()
 #if os(iOS)
@@ -125,6 +126,7 @@ struct PlayerView: View {
         }
         .onDisappear {
             controller.stopPlayback()
+            OrientationManager.shared.lockToPortrait()
         }
         .sheet(isPresented: $showAudioSheet) {
             TrackSelectionSheet(

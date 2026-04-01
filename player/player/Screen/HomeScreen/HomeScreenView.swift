@@ -6,11 +6,12 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct HomeScreenView : View {
     var onSubmit: (URL) -> Void = { _ in }
     
-    @State private var urlText: String = "https://dl-a10b-1542.mypikpak.com/download/?fid=2_5pmY3pb30KFMdtz4jM0xLyVJbvLWXMM85nJ8FopW5sh8zR588OjTNY5bdUjtegqq5BS0aeCZyNrf5ogShgPGDoZzT-vUu_tJ2oJhKlEDU=&from=5&verno=3&prod=pikpak&expire=1775056206&g=5E0850D616A18C646F060BF580B6C933DFC84782&ui=aJgD4HNLZR8dbfo1&t=0&ms=81600000&th=81600000&f=1661725618&alt=0&us=0&hspu=&po=0&userid=aJgD4HNLZR8dbfo1&fileid=VOnXnmMfMpe2wiXeu2hUrNCSo2&pr=XQPkPvr9WWiIuMvELmrVemzS3dNokdyW-NYmmbFU2np-HKPfvum_gW6CCVQ0soCjMxEl6WQuy5SrDceb3ny5phru1j5NHs9ozOVy9L-PUhdbDo4Sbfed6FmOq2T7n8OGVC5oK9M6BugiQb885Rd5yh6v00lHSkjRpldMOUqNO31Eii4wy9hkZJ9C8h2auy9kI1C_zXKPlyTc4xzDVBiKWy78WhPHTh6XLmFJ2_vPk2GCVrCjEZZ24q4B3uGorBmSyy35Z2mhaoz-EJPjsX9PDpkocYxHHNe4oYUwSyRC78923Lz-1AvMCtEqfDzg3wA-LaOX2-Lt-_oQxeybD54qXEv0Y4nF-cRkRGSKXeVMO_ZUsv4ebpXD5NyLGgAy_ilwrWVUBLuV6Urfmk7Hn_t64JtVIZnnW9cAvhoGfD7Cvkqw5WVIKM21Qpsy2TPPi6IE&sign=279C5DBB8CB8308872635DD134F36A90"
+    @State private var urlText: String = ""
     @State private var showInvalidURLAlert: Bool = false
     
     var body: some View {
@@ -38,28 +39,43 @@ struct HomeScreenView : View {
                             .font(.system(size: 14, weight: .semibold, design: .rounded))
                             .foregroundStyle(.white.opacity(0.8))
                         
-                        HStack(spacing: 10) {
-                            Image(systemName: "link")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.6))
-                            
-                            TextField("", text: $urlText)
+                        HStack(alignment: .center, spacing: 0) {
+                            TextField("Paste your link", text: $urlText)
+                                .textFieldStyle(.plain)
+                                .lineLimit(1)
                                 .keyboardType(.URL)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .submitLabel(.go)
                                 .foregroundStyle(.white)
                                 .font(.system(size: 15, weight: .medium, design: .rounded))
+                                .padding(.leading, 12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .onSubmit {
                                     submitIfPossible()
                                 }
+                            
+                            Rectangle()
+                                .fill(Color.white.opacity(0.12))
+                                .frame(width: 1)
+                                .frame(height: 22)
+                            
+                            Button(action: pasteFromClipboard) {
+                                Text("Paste")
+                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 12)
+                                    .frame(minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
+                        .frame(height: 44)
                         .background(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .fill(Color.white.opacity(0.06))
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.white.opacity(0.08))
                         )
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     
                     HStack(spacing: 6) {
@@ -119,6 +135,12 @@ struct HomeScreenView : View {
         }
     }
     
+    private func pasteFromClipboard() {
+        if let string = UIPasteboard.general.string {
+            urlText = string
+        }
+    }
+    
     private func submitIfPossible() {
         let trimmed = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed),
@@ -128,6 +150,7 @@ struct HomeScreenView : View {
             showInvalidURLAlert = true
             return
         }
+        urlText = ""
         onSubmit(url)
     }
 }

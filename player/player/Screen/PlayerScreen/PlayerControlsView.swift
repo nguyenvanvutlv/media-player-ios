@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Overlay chrome: top bar, center play/pause, bottom bar with progress, skip, and track actions.
+/// Overlay chrome: top bar, bottom bar (play/pause, skip, progress, track actions) with a light dim when visible.
 struct PlayerControlsView: View {
     @ObservedObject var state: PlayerState
 
@@ -32,6 +32,14 @@ struct PlayerControlsView: View {
 
     var body: some View {
         ZStack {
+            if showChrome {
+                Rectangle()
+                    .fill(Color.black.opacity(0.18))
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -42,8 +50,6 @@ struct PlayerControlsView: View {
                 VStack(spacing: 0) {
                     topBar
                     Spacer()
-                    centerPlay
-                    Spacer()
                     bottomBar
                 }
                 .transition(.opacity)
@@ -52,6 +58,16 @@ struct PlayerControlsView: View {
         .animation(.easeInOut(duration: 0.25), value: showChrome)
         .onAppear {
             scheduleAutoHide()
+        }
+        .onChange(of: state.isBuffering) { _, buffering in
+            if buffering {
+                withAnimation {
+                    showChrome = true
+                }
+                cancelAutoHide()
+            } else {
+                scheduleAutoHide()
+            }
         }
     }
 
@@ -83,18 +99,6 @@ struct PlayerControlsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
-    }
-
-    private var centerPlay: some View {
-        Button(action: onPlayPause) {
-            Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 36))
-                .foregroundStyle(.white)
-                .frame(width: 80, height: 80)
-                .background(Color.white.opacity(0.15))
-                .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
     }
 
     private var bottomBar: some View {
@@ -142,6 +146,7 @@ struct PlayerControlsView: View {
             }
 
             HStack(spacing: 16) {
+                playPauseButton
                 chromeIconButton(systemName: "gobackward.10", action: onSkipBack)
                 chromeIconButton(systemName: "goforward.10", action: onSkipForward)
                 Spacer(minLength: 0)
@@ -156,6 +161,18 @@ struct PlayerControlsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 12)
+    }
+
+    private var playPauseButton: some View {
+        Button(action: onPlayPause) {
+            Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: 20))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(Color.white.opacity(0.12))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func chromeIconButton(systemName: String, action: @escaping () -> Void) -> some View {
@@ -179,9 +196,11 @@ struct PlayerControlsView: View {
 
     private func scheduleAutoHide() {
         cancelAutoHide()
+        guard !state.isBuffering else { return }
         hideTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard !Task.isCancelled else { return }
+            guard !state.isBuffering else { return }
             withAnimation {
                 showChrome = false
             }

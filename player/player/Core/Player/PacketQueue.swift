@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 
 /// Thread-safe bounded packet queue for the demux→decode pipeline.
 /// One producer (demux thread) pushes cloned packets; one consumer (decode thread) takes them.
@@ -34,14 +35,21 @@ final class PacketQueue {
     @discardableResult
     func put(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
         condition.lock()
+        #if DEBUG
+            let waitStart = CACurrentMediaTime()
+            var didWait = false
+        #endif
         while count_ >= capacity && !closed {
+            #if DEBUG
+                didWait = true
+            #endif
             condition.wait()
         }
         if closed {
             condition.unlock()
             return false
         }
-        
+
         // Clone the packet so the caller can unref the original.
         let clone = av_packet_alloc()!
         av_packet_ref(clone, packet)
@@ -49,9 +57,22 @@ final class PacketQueue {
         ring[tail] = clone
         tail = (tail + 1) % capacity
         count_ += 1
-        
-        condition.signal() // wake up any waiting consumer
+
+        condition.signal()  // wake up any waiting consumer
         condition.unlock()
+        #if DEBUG
+            if didWait {
+                let waitedMs = (CACurrentMediaTime() - waitStart) * 1000.0
+                if waitedMs >= 150 {
+                    PlaybackLog.backlog(
+                        String(
+                            format: "[PacketQueue] producer blocked %.1fms capacity=%d count=%d",
+                            waitedMs, capacity, count_
+                        )
+                    )
+                }
+            }
+        #endif
         return true
     }
 
@@ -59,9 +80,9 @@ final class PacketQueue {
     /// `timeoutMs`: max wait in ms; 0 = indefinite.
     func take(timeoutMs: Int = 200) -> UnsafeMutablePointer<AVPacket>? {
         condition.lock()
-        
+
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
-        
+
         while count_ == 0 && !closed {
             if timeoutMs > 0 {
                 let signaled = condition.wait(until: deadline)
@@ -73,22 +94,22 @@ final class PacketQueue {
                 condition.wait()
             }
         }
-        
+
         if closed && count_ == 0 {
             condition.unlock()
             return nil
         }
-        
+
         if count_ > 0 {
             let pkt = ring[head]
             ring[head] = nil
             head = (head + 1) % capacity
             count_ -= 1
-            condition.signal() // wake up waiting producer
+            condition.signal()  // wake up waiting producer
             condition.unlock()
             return pkt
         }
-        
+
         condition.unlock()
         return nil
     }
@@ -107,7 +128,7 @@ final class PacketQueue {
         }
         head = 0
         tail = 0
-        condition.broadcast() // Wake any blocked consumer or producer
+        condition.broadcast()  // Wake any blocked consumer or producer
         condition.unlock()
     }
 

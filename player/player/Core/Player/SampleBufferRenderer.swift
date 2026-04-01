@@ -80,7 +80,8 @@ final class SampleBufferRenderer {
     let displayLayer = AVSampleBufferDisplayLayer()
     /// Queue management + enqueue: use renderer on iOS 18+ (layer’s `AVQueuedSampleBufferRendering` API is deprecated).
     private var videoRenderer: AVSampleBufferVideoRenderer { displayLayer.sampleBufferRenderer }
-    private let displayQueue = DispatchQueue(label: "com.nvv.player.displayLayer.enqueue", qos: .userInteractive)
+    private let displayQueue = DispatchQueue(
+        label: "com.nvv.player.displayLayer.enqueue", qos: .userInteractive)
     private var controlTimebase: CMTimebase?
     private var timelineStarted = false
     /// Prefill a few frames before starting the timebase. This reduces visible stutter/freeze on some devices
@@ -303,7 +304,8 @@ final class SampleBufferRenderer {
         }
         let droppedNow = fifo.takeAndResetDroppedCount()
         if droppedNow > 0 {
-            PlaybackLog.backlog("[Render] dropped \(droppedNow) video frame(s) due to FIFO capacity")
+            PlaybackLog.backlog(
+                "[Render] dropped \(droppedNow) video frame(s) due to FIFO capacity")
         }
         // Avoid blocking the main thread by enqueueing huge bursts in one run,
         // especially right after seek when decode can fill the FIFO quickly.
@@ -379,7 +381,9 @@ final class SampleBufferRenderer {
             let desc = err.localizedDescription
             if lastLoggedDisplayErrorDescription != desc {
                 lastLoggedDisplayErrorDescription = desc
-                PlaybackLog.displayLayerError("AVSampleBufferDisplayLayer error after enqueue: \(desc) status=\(String(describing: videoRenderer.status))")
+                PlaybackLog.displayLayerError(
+                    "AVSampleBufferDisplayLayer error after enqueue: \(desc) status=\(String(describing: videoRenderer.status))"
+                )
             }
         }
     }

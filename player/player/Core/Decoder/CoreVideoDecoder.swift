@@ -91,25 +91,27 @@ final class CoreVideoDecoder {
         }
     }
 
-    func open(codecpar: UnsafePointer<AVCodecParameters>, forceSoftwareDecode: Bool = false) throws {
+    func open(codecpar: UnsafePointer<AVCodecParameters>, forceSoftwareDecode: Bool = false) throws
+    {
         close()
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw CoreVideoDecoderError.noCodec
         }
         #if os(iOS) || os(tvOS)
-        if !forceSoftwareDecode {
-            do {
-                try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: true)
-                return
-            } catch {
+            if !forceSoftwareDecode {
+                do {
+                    try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: true)
+                    return
+                } catch {
+                    PlaybackLog.video(
+                        "[Video][WARN] VideoToolbox hwaccel unavailable or open failed — software fallback (\(String(describing: error)))"
+                    )
+                    close()
+                }
+            } else {
                 PlaybackLog.video(
-                    "[Video][WARN] VideoToolbox hwaccel unavailable or open failed — software fallback (\(String(describing: error)))"
-                )
-                close()
+                    "[Video] software decode requested — VideoToolbox hwaccel skipped")
             }
-        } else {
-            PlaybackLog.video("[Video] libass enabled → forcing software decode (VideoToolbox disabled)")
-        }
         #endif
         try openCodecContext(codecpar: codecpar, codec: codec, useVideoToolboxHw: false)
     }

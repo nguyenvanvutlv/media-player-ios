@@ -319,6 +319,13 @@ final class FFmpegPlaybackEngine {
     private var lastAudioScheduledEndSeconds: Double = 0
     private var lastBacklogLogHostTime: CFTimeInterval = 0
 
+    // MARK: - Stall diagnostics
+    private let progressLock = NSLock()
+    private var lastDemuxPacketHostTime: CFTimeInterval = 0
+    private var lastVideoFrameHostTime: CFTimeInterval = 0
+    private var lastAudioScheduleHostTime: CFTimeInterval = 0
+    private var lastStallSnapshotHostTime: CFTimeInterval = 0
+
     private let displayLinkDriver = DisplayLinkDriver()
 
     private let playerState: PlayerState
@@ -379,6 +386,13 @@ final class FFmpegPlaybackEngine {
         stopPlayback()
         sessionRunning = true
         resetPlaybackControlStateForNewSession()
+        progressLock.lock()
+        let now = CACurrentMediaTime()
+        lastDemuxPacketHostTime = now
+        lastVideoFrameHostTime = now
+        lastAudioScheduleHostTime = now
+        lastStallSnapshotHostTime = 0
+        progressLock.unlock()
         videoEnqueueLogCount = 0
         setMediaTimelineAnchor(0)
         embeddedCueLock.lock()
@@ -386,13 +400,13 @@ final class FFmpegPlaybackEngine {
         embeddedCueLock.unlock()
         externalCues.removeAll()
         playerState.resetForNewMedia()
-        playerState.title = url.lastPathComponent
 
         // Reopen packet queues for the new session.
         videoPacketQueue.reopen()
         audioPacketQueue.reopen()
 
         displayLinkDriver.start()
+        PlaybackLog.lifecycle("startPlayback url=\(url.absoluteString)")
 
         sampleRenderer.onFirstFrameEnqueued = { [weak self] in
             Task { @MainActor in
@@ -439,6 +453,7 @@ final class FFmpegPlaybackEngine {
 
     @MainActor
     func stopPlayback() {
+        PlaybackLog.lifecycle("stopPlayback begin")
         displayLinkDriver.stop()
         hasActiveAudioStreamForClock = false
         masterClock.resetForNewSession()
@@ -467,6 +482,7 @@ final class FFmpegPlaybackEngine {
         audioEngine?.stop()
         audioEngine = nil
         audioPlayerNode = nil
+        PlaybackLog.lifecycle("stopPlayback complete")
     }
 
     @MainActor
@@ -670,6 +686,10 @@ final class FFmpegPlaybackEngine {
             onPlaybackTick?(clamped)
         }
 
+        // Stall watchdog: if all three subsystems stop making progress (demux, video, audio),
+        // capture a state snapshot. This targets the "plays briefly then freezes" class of bugs.
+        stallWatchdogTick()
+
         // Backlog-driven logs: emit only when thresholds are exceeded (at most 2Hz).
         // This lets us see which subsystem is causing stalls without spamming per-frame logs.
         let now = CACurrentMediaTime()
@@ -692,6 +712,73 @@ final class FFmpegPlaybackEngine {
                     + "audio_scheduled_end=\(String(format: "%.3f", audioEnd))s"
             )
         }
+    }
+
+    private func noteDemuxPacketProgress() {
+        progressLock.lock()
+        lastDemuxPacketHostTime = CACurrentMediaTime()
+        progressLock.unlock()
+    }
+
+    private func noteVideoFrameProgress() {
+        progressLock.lock()
+        lastVideoFrameHostTime = CACurrentMediaTime()
+        progressLock.unlock()
+    }
+
+    private func noteAudioScheduleProgress() {
+        progressLock.lock()
+        lastAudioScheduleHostTime = CACurrentMediaTime()
+        progressLock.unlock()
+    }
+
+    private func stallWatchdogTick() {
+        guard sessionRunning else { return }
+        if isScrubbingActive() || isPresentationPaused() { return }
+        let now = CACurrentMediaTime()
+        progressLock.lock()
+        let demuxT = lastDemuxPacketHostTime
+        let videoT = lastVideoFrameHostTime
+        let audioT = lastAudioScheduleHostTime
+        let lastSnap = lastStallSnapshotHostTime
+        progressLock.unlock()
+
+        let demuxIdle = now - demuxT
+        let videoIdle = now - videoT
+        let audioIdle = now - audioT
+
+        // Only snapshot when *everything* is idle for a while; throttle snapshots.
+        if demuxIdle < 2.5 || videoIdle < 2.5 || audioIdle < 2.5 { return }
+        if (now - lastSnap) < 2.0 { return }
+
+        progressLock.lock()
+        lastStallSnapshotHostTime = now
+        progressLock.unlock()
+
+        let vq = videoPacketQueue.count
+        let aq = audioPacketQueue.count
+        let rs = sampleRenderer.backlogStatus()
+        let audioRunning = audioPlayerNode?.engine?.isRunning ?? false
+        let nodeExists = (audioPlayerNode != nil)
+        let demuxIdxV = demuxer.videoStreamIndex
+        let demuxIdxA = demuxer.audioStreamIndex
+
+        PlaybackLog.playbackError(
+            String(
+                format:
+                    "STALL snapshot idle: demux=%.1fs video=%.1fs audio=%.1fs | pktQ v=%d a=%d | render fifo=%d req=%d ready=%d drain_susp=%d status=%@ | audio node=%d running=%d | streams v=%d a=%d",
+                demuxIdle, videoIdle, audioIdle,
+                vq, aq,
+                rs.fifoCount,
+                rs.isRequestingMediaData ? 1 : 0,
+                rs.isReadyForMoreMediaData ? 1 : 0,
+                rs.drainSuspended ? 1 : 0,
+                String(describing: rs.displayStatus),
+                nodeExists ? 1 : 0,
+                audioRunning ? 1 : 0,
+                demuxIdxV, demuxIdxA
+            )
+        )
     }
 
     // MARK: - Audio engine probe
@@ -776,7 +863,8 @@ final class FFmpegPlaybackEngine {
         audioScheduleShiftSeconds = 0
 
         if demuxer.videoStreamIndex >= 0, let vp = demuxer.videoCodecParameters() {
-            try videoDecoder.open(codecpar: vp, forceSoftwareDecode: enableLibass)
+            // libass affects subtitle overlay rendering only; video decode always prefers VideoToolbox when available.
+            try videoDecoder.open(codecpar: vp)
             videoDecoder.setPresentationShiftSeconds(0)
             // Phase 8 perf guard: if HW decode isn't available, reject overly heavy streams early.
             #if os(iOS) || os(tvOS)
@@ -837,13 +925,9 @@ final class FFmpegPlaybackEngine {
         let subs = Self.buildSubtitleTracks(demuxer: demuxer, externalURLs: externalSubtitleURLs)
         let dur = demuxer.durationSeconds
         let audioIdx = demuxer.activeAudioTrackListIndex()
-        let titleText: String = {
-            if let t = demuxer.formatTitleOrURL(), !t.hasPrefix("http") {
-                return (t as NSString).lastPathComponent
-            }
-            if let t = demuxer.formatTitleOrURL() { return t }
-            return ""
-        }()
+        let titleText =
+            demuxer.formatMetadataDisplayTitle()?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ""
         DispatchQueue.main.async {
             self.playerState.audioTracks = audio
             self.playerState.subtitleTracks = subs
@@ -939,7 +1023,8 @@ final class FFmpegPlaybackEngine {
         let embeddedCount = demuxer.subtitleStreamIndices.count
         if index <= embeddedCount {
             let si = demuxer.subtitleStreamIndices[index - 1]
-            PlaybackLog.subtitleSelection("[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
+            PlaybackLog.subtitleSelection(
+                "[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
             guard let par = demuxer.codecParameters(streamIndex: si) else {
                 PlaybackLog.subtitleSelection(
                     "subtitle decoder open FAILED: no codec parameters streamIndex=\(si)")
@@ -965,7 +1050,8 @@ final class FFmpegPlaybackEngine {
                 )
             }
         } else {
-            PlaybackLog.subtitleSelection("[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
+            PlaybackLog.subtitleSelection(
+                "[subtitle] mode = \(enableLibass ? "libass (overlay)" : "bitmap")")
             PlaybackLog.subtitleSelection(
                 "subtitle external track — using preloaded cues (no embedded decoder)")
         }
@@ -1107,6 +1193,7 @@ final class FFmpegPlaybackEngine {
         }
         let when = AVAudioTime(sampleTime: sampleTime + audioPlayheadSampleOffset, atRate: sr)
         node.scheduleBuffer(buffer, at: when, options: [], completionHandler: nil)
+        noteAudioScheduleProgress()
         lastAudioScheduleEndSample = sampleTime + AVAudioFramePosition(buffer.frameLength)
 
         // Targeted sync debug (sampled): audio pts, video clock, anchor, and schedule cursor.
@@ -1329,6 +1416,7 @@ final class FFmpegPlaybackEngine {
                 throw error
             }
             if !has { break }
+            noteDemuxPacketProgress()
 
             let idx = Int(packet.pointee.stream_index)
 
@@ -1465,6 +1553,7 @@ final class FFmpegPlaybackEngine {
                 }
                 logVideoFrameIfNeeded(sample)
                 enqueueVideoAfterSync(sample: sample)
+                noteVideoFrameProgress()
             }
             checkBufferingGate()
         }

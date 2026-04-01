@@ -5,6 +5,7 @@ import UIKit
 /// Unified logging for A/V sync, timing, and display-layer diagnostics (Console + Instruments).
 enum PlaybackLog {
     enum Channel: String, CaseIterable {
+        case lifecycle
         case seek
         case ffmpeg
         case video
@@ -15,11 +16,18 @@ enum PlaybackLog {
 
     // Runtime-togglable log channels (DEBUG only). In Release, keep behavior minimal.
     private static let channelLock = NSLock()
-    private static var enabledChannels: Set<Channel> = [.subtitle]
+    private static var enabledChannels: Set<Channel> = {
+#if DEBUG
+        // Default to "useful for stalls" channels in DEBUG.
+        return [.lifecycle, .seek, .ffmpeg, .video, .audio, .subtitle, .backlog]
+#else
+        return [.seek, .ffmpeg, .video, .audio, .subtitle]
+#endif
+    }()
 
     /// When enabled, only logs that are explicitly related to libass will be emitted.
     /// This is intended as a temporary noise-reduction switch during libass integration.
-    private static var libassOnlyLogging: Bool = true
+    private static var libassOnlyLogging: Bool = false
 
     static func setChannelEnabled(_ channel: Channel, enabled: Bool) {
         channelLock.lock()
@@ -50,6 +58,7 @@ enum PlaybackLog {
     private static let seekLog = Logger(subsystem: "com.nvv.player", category: "seek")
     private static let ffmpegLog = Logger(subsystem: "com.nvv.player", category: "ffmpeg")
     private static let pipLog = Logger(subsystem: "com.nvv.player", category: "pip")
+    private static let lifecycleLog = Logger(subsystem: "com.nvv.player", category: "lifecycle")
 
     /// `OSStatus -50` (`paramErr`) often appears when re-applying the same `AVAudioSession` category; playback can still work.
     static func isBenignAudioSessionOSStatus50(_ error: Error) -> Bool {
@@ -60,6 +69,14 @@ enum PlaybackLog {
     static func sync(_ message: String) {
         // Single sink: Logger + os_log already surface in Console; avoid duplicating the same line as NSLog.
         syncLog.info("[player.sync] \(message, privacy: .public)")
+    }
+
+    static func lifecycle(_ message: String) {
+        guard isChannelEnabled(.lifecycle) else { return }
+        lifecycleLog.info("[Lifecycle] \(message, privacy: .public)")
+#if DEBUG
+        NSLog("[player.lifecycle] %@", message)
+#endif
     }
 
     static func video(_ message: String) {

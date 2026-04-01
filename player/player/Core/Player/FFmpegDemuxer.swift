@@ -17,6 +17,13 @@ struct FFmpegStreamInfo {
 
 /// Demux-only: `avformat_open_input`, `find_stream_info`, `av_read_frame`.
 final class FFmpegDemuxer {
+    /// MKV/BD remux với PGS + ảnh bìa MJPEG thường cần đọc nhiều hơn mặc định (~5MB) mới đủ tham số codec.
+    private static let probeSizeBytes: Int64 = 64 * 1024 * 1024
+    /// Giới hạn thời gian (µs) để `avformat_find_stream_info` phân tích packet đầu vào.
+    private static let maxAnalyzeDurationUs: Int64 = 15_000_000
+    /// Tăng số frame dùng ước lượng FPS (tránh cảnh báo “not enough frames to estimate rate” trên một số track).
+    private static let fpsProbeFrameCount: Int32 = 32
+
     private(set) var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var packet: UnsafeMutablePointer<AVPacket>?
     private var interruptState: UnsafeMutablePointer<FFmpegInterruptState>?
@@ -52,6 +59,11 @@ final class FFmpegDemuxer {
             ff_format_set_interrupt_callback(f, st)
         }
 
+        // Matroska + PGS + MJPEG cover: default probesize is too small → “unspecified size” / failed stream info.
+        fmt?.pointee.probesize = Self.probeSizeBytes
+        fmt?.pointee.max_analyze_duration = Self.maxAnalyzeDurationUs
+        fmt?.pointee.fps_probe_size = Self.fpsProbeFrameCount
+
         let cstr = url.absoluteString.cString(using: .utf8)!
         var ret = avformat_open_input(&fmt, cstr, nil, nil)
         if ret < 0 { throw FFmpegDemuxerError.openFailed(code: ret) }
@@ -74,7 +86,7 @@ final class FFmpegDemuxer {
             streamInfos[i] = Self.makeStreamInfo(stream: st, streamIndex: i, mediaType: type)
         }
 
-        videoStreamIndex = Int(av_find_best_stream(fc, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
+        videoStreamIndex = Self.selectPrimaryVideoStreamIndex(formatContext: fc)
         audioStreamIndex = Int(av_find_best_stream(fc, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0))
         if audioStreamIndex < 0, let first = audioStreamIndices.first {
             audioStreamIndex = first
@@ -101,18 +113,36 @@ final class FFmpegDemuxer {
         streamInfos[streamIndex]
     }
 
-    func formatTitleOrURL() -> String? {
+    /// Display title from container / stream tags only (never the input URL).
+    func formatMetadataDisplayTitle() -> String? {
         guard let fmt = formatContext else { return nil }
         if let dict = fmt.pointee.metadata {
-            if let t = av_dict_get(dict, "title", nil, 0), let c = t.pointee.value {
-                return String(cString: c)
+            for key in Self.displayTitleMetadataKeys {
+                if let e = av_dict_get(dict, key, nil, 0), let v = e.pointee.value {
+                    let s = String(cString: v).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !s.isEmpty { return s }
+                }
             }
         }
-        if let url = fmt.pointee.url {
-            return String(cString: url)
+        if videoStreamIndex >= 0,
+           let streams = fmt.pointee.streams,
+           let st = streams[videoStreamIndex],
+           let dict = st.pointee.metadata {
+            for key in Self.displayTitleMetadataKeys {
+                if let e = av_dict_get(dict, key, nil, 0), let v = e.pointee.value {
+                    let s = String(cString: v).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !s.isEmpty { return s }
+                }
+            }
         }
         return nil
     }
+
+    private static let displayTitleMetadataKeys: [String] = [
+        "title", "TITLE", "Title",
+        "show_name", "episode_title",
+        "album", "ALBUM",
+    ]
 
     /// Seek: prefer **video stream** `time_base` + `start_time` so the target matches decoded PTS; then `avformat_flush`.
     /// When `flags == 0`, uses `AVSEEK_FLAG_BACKWARD` so the demuxer lands on a keyframe at or before the target (required for correct decode after flush).
@@ -155,6 +185,52 @@ final class FFmpegDemuxer {
         if ret < 0 { throw FFmpegDemuxerError.seekFailed(code: ret) }
         avformat_flush(fmt)
         PlaybackLog.ffmpeg("seek OK ret=\(ret) clamped=\(String(format: "%.3f", clamped))s")
+    }
+
+    /// Chọn video chính: bỏ qua `ATTACHED_PIC` (cover MJPEG) và ưu tiên codec “phim” + độ phân giải lớn nhất.
+    private static func selectPrimaryVideoStreamIndex(formatContext: UnsafeMutablePointer<AVFormatContext>) -> Int {
+        let nb = Int(formatContext.pointee.nb_streams)
+        guard let streams = formatContext.pointee.streams else {
+            return Int(av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
+        }
+
+        struct VideoCandidate {
+            let index: Int
+            let area: Int
+            let isAttachedPic: Bool
+            let isStillImageCodec: Bool
+        }
+
+        var candidates: [VideoCandidate] = []
+        for i in 0..<nb {
+            guard let st = streams[i] else { continue }
+            guard let par = st.pointee.codecpar else { continue }
+            if par.pointee.codec_type != AVMEDIA_TYPE_VIDEO { continue }
+            let w = max(0, Int(par.pointee.width))
+            let h = max(0, Int(par.pointee.height))
+            let area = w * h
+            let disp = st.pointee.disposition
+            let isAttached = (Int32(disp) & AV_DISPOSITION_ATTACHED_PIC) != 0
+            let cid = par.pointee.codec_id
+            let isStill =
+                cid == AV_CODEC_ID_MJPEG || cid == AV_CODEC_ID_PNG || cid == AV_CODEC_ID_JPEG2000
+            candidates.append(VideoCandidate(index: i, area: area, isAttachedPic: isAttached, isStillImageCodec: isStill))
+        }
+
+        if candidates.isEmpty {
+            return Int(av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
+        }
+
+        let withoutAttached = candidates.filter { !$0.isAttachedPic }
+        let pool1 = withoutAttached.isEmpty ? candidates : withoutAttached
+
+        let preferMotion = pool1.filter { !$0.isStillImageCodec }
+        let pool2 = preferMotion.isEmpty ? pool1 : preferMotion
+
+        if let best = pool2.max(by: { $0.area < $1.area }) {
+            return best.index
+        }
+        return Int(av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
     }
 
     private static func computeDurationSeconds(formatContext: UnsafeMutablePointer<AVFormatContext>) -> Double {
