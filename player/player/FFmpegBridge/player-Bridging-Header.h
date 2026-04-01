@@ -15,7 +15,11 @@
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#if __has_include(<ass/ass.h>)
+#include <ass/ass.h>
+#else
 #include "../../../libass/libass/ass.h"
+#endif
 
 #import "FFmpegBridge.h"
 

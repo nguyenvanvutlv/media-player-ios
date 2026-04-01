@@ -376,6 +376,11 @@ struct SettingScreenView : View {
                 title: "Size",
                 description: "Adjust subtitle font size."
             ) {
+#if os(tvOS)
+                Text("\(subtitleSizeMultiplier, specifier: "%.2f")×")
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(maxWidth: 170, alignment: .trailing)
+#else
                 Slider(
                     value: Binding(
                         get: { subtitleSizeMultiplier },
@@ -385,6 +390,7 @@ struct SettingScreenView : View {
                 )
                     .tint(.white)
                     .frame(maxWidth: 170)
+#endif
             }
             
             // Position
@@ -392,6 +398,11 @@ struct SettingScreenView : View {
                 title: "Vertical position",
                 description: "Move subtitles up or down."
             ) {
+#if os(tvOS)
+                Text("\(subtitleSettings.first?.position ?? 0.0, specifier: "%.0f")")
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(maxWidth: 170, alignment: .trailing)
+#else
                 Slider(
                     value: Binding(
                         get: { subtitleSettings.first?.position ?? 0.0 },
@@ -401,6 +412,7 @@ struct SettingScreenView : View {
                 )
                     .tint(.white)
                     .frame(maxWidth: 170)
+#endif
             }
             
             // Color

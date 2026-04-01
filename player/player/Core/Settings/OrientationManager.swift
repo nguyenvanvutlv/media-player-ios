@@ -1,5 +1,16 @@
 import UIKit
 
+#if os(tvOS)
+@MainActor
+final class OrientationManager {
+    static let shared = OrientationManager()
+    private init() {}
+
+    func lock(to mask: UInt) {}
+    func lockToPortrait() {}
+    func lockToLandscape() {}
+}
+#else
 @MainActor
 final class OrientationManager {
     static let shared = OrientationManager()
@@ -56,3 +67,4 @@ private extension UIWindowScene {
     }
 }
 
+#endif

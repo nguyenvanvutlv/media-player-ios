@@ -57,12 +57,23 @@ struct TrackSelectionSheet: View {
                 }
             }
             .navigationTitle(mode == .audio ? "Audio" : "Subtitles")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayModeInlineIfAvailable()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                 }
             }
         }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func navigationBarTitleDisplayModeInlineIfAvailable() -> some View {
+#if os(tvOS)
+        self
+#else
+        self.navigationBarTitleDisplayMode(.inline)
+#endif
     }
 }

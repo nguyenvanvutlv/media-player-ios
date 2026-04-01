@@ -59,7 +59,10 @@ struct HomeScreenView : View {
                                 .fill(Color.white.opacity(0.12))
                                 .frame(width: 1)
                                 .frame(height: 22)
-                            
+
+#if os(tvOS)
+                            // UIPasteboard is unavailable on tvOS.
+#else
                             Button(action: pasteFromClipboard) {
                                 Text("Paste")
                                     .font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -69,6 +72,7 @@ struct HomeScreenView : View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+#endif
                         }
                         .frame(height: 44)
                         .background(
@@ -136,9 +140,12 @@ struct HomeScreenView : View {
     }
     
     private func pasteFromClipboard() {
+#if os(tvOS)
+#else
         if let string = UIPasteboard.general.string {
             urlText = string
         }
+#endif
     }
     
     private func submitIfPossible() {

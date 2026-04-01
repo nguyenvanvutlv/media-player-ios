@@ -67,3 +67,4 @@ docs/
 output/
 .DS_Store
 build/
+build-dynamic/

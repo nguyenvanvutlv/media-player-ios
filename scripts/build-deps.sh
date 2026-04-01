@@ -34,6 +34,9 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 MIN_IOS="${MIN_IOS:-13.0}"
 MIN_TVOS="${MIN_TVOS:-13.0}"
 SKIP_SIM_X86="${SKIP_SIM_X86:-0}"
+# When enabled, build libass as a shared library (dylib) while keeping
+# freetype/fribidi/harfbuzz static to minimize runtime-embedded dylib count.
+DEPS_LIBASS_DYNAMIC="${DEPS_LIBASS_DYNAMIC:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -143,6 +146,7 @@ EOF
 write_meson_cross_file() {
   local target="$1"
   local cross_file="$2"
+  local default_library="${3:-static}"
 
   # Turn a shell string of flags into a Meson array of quoted tokens.
   # Example: "-arch arm64 -isysroot /SDK" -> "'-arch', 'arm64', '-isysroot', '/SDK'"
@@ -186,7 +190,7 @@ c_args = [${c_args_array}]
 c_link_args = [${c_link_args_array}]
 cpp_args = [${c_args_array}]
 cpp_link_args = [${c_link_args_array}]
-default_library = 'static'
+default_library = '${default_library}'
 EOF
 }
 
@@ -248,7 +252,7 @@ build_harfbuzz() {
   local build_dir="${TARGET_WORK}/harfbuzz-build"
   local cross="${TARGET_WORK}/meson-${target}.ini"
   fetch_and_extract "${HARFBUZZ_URL}" "${src_dir}"
-  write_meson_cross_file "${target}" "${cross}"
+  write_meson_cross_file "${target}" "${cross}" "static"
   rm -rf "${build_dir}"
 
   local pc_env
@@ -279,7 +283,11 @@ build_libass() {
   local target="$1"
   local build_dir="${TARGET_WORK}/libass-build"
   local cross="${TARGET_WORK}/meson-${target}.ini"
-  write_meson_cross_file "${target}" "${cross}"
+  if [[ "${DEPS_LIBASS_DYNAMIC}" == "1" ]]; then
+    write_meson_cross_file "${target}" "${cross}" "shared"
+  else
+    write_meson_cross_file "${target}" "${cross}" "static"
+  fi
   rm -rf "${build_dir}"
 
   local pc_env
